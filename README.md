@@ -91,6 +91,7 @@ The package ships built-in default briefs and stage templates, but the intended 
 - all stage templates
 
 The generated config points at the local `.maker-checker/templates/stages/*.md` files, so edits there take effect immediately on the next run.
+The package defaults under `maker_checker_app/defaults/` are the seed source of truth; there is no separate repo-root scaffold to maintain anymore.
 
 ## Layout
 
@@ -104,8 +105,8 @@ Inside `.maker-checker/`:
 - `runs/latest_status.json`: latest live status in JSON
 - `runs/runtime_state.json`: stable dashboard/API state
 - `runs/latest_summary.md`: latest run summary
-- `memory/run_history.md`: human-readable cross-run memory
-- `memory/run_history.jsonl`: structured cross-run memory
+- `memory/run_history.md`: human-readable carry-forward notes
+- `memory/run_history.jsonl`: structured carry-forward notes
 
 Each run directory also contains:
 
@@ -143,6 +144,7 @@ Compatibility aliases under `/api/*` still exist.
 ## Notes
 
 - Default config path: `.maker-checker/config.toml`
+- Default history window: the latest 2 runs, rendered as compact carry-forward notes
 - `input_mode = "stdin"` sends the rendered stage prompt via stdin
 - `input_mode = "file"` injects `{prompt_file}` into the command
 - Available placeholders: `{prompt_file}`, `{output_file}`, `{stage_dir}`, `{session_id}`

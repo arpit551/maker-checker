@@ -2,7 +2,7 @@
 .venv/
 __pycache__/
 *.pyc
-
-runs/
-memory/run_history.jsonl
-memory/run_history.md
+.maker-checker/
+build/
+dist/
+*.egg-info/

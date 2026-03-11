@@ -121,6 +121,7 @@ class TestLoadConfig:
     def test_valid_config(self, minimal_config_toml: Path):
         cfg = mc.load_config(minimal_config_toml)
         assert cfg.max_cycles == 2
+        assert cfg.history_limit == mc.DEFAULT_HISTORY_LIMIT
         assert "mock" in cfg.agents
         assert set(cfg.stages.keys()) == set(mc.REQUIRED_STAGES)
 
@@ -1112,6 +1113,64 @@ class TestMain:
         assert (tmp_path / ".maker-checker" / "config.toml").exists()
 
 
+class TestHistoryContext:
+    def test_render_history_context_is_compact(self):
+        entries = [
+            {
+                "run_id": "run-1",
+                "outcome": "failed",
+                "issue_trend": "3 -> 2",
+                "improvements": ["Resolved one flaky test."],
+                "failures": ["Long failure detail that should not become a multi-bullet dump in prompt memory."],
+                "next_run_notes": ["Tighten the brief around invalid input handling before retrying."],
+                "task_excerpt": "should be ignored",
+                "evaluation_excerpt": "should be ignored",
+            },
+            {
+                "run_id": "run-2",
+                "outcome": "completed",
+                "issue_trend": "1 -> 0",
+                "improvements": ["Run finished cleanly."],
+                "failures": [],
+                "next_run_notes": ["Reuse this prompt structure; the run converged successfully."],
+            },
+        ]
+
+        rendered = mc.render_history_context(entries, limit=2)
+
+        assert rendered.count("### ") == 2
+        assert "- Outcome: failed; Issue trend: 3 -> 2" in rendered
+        assert "- Carry forward: Tighten the brief around invalid input handling before retrying." in rendered
+        assert "task_excerpt" not in rendered
+        assert "evaluation_excerpt" not in rendered
+        assert "Improved:" not in rendered
+        assert "Failed:" not in rendered
+
+    def test_build_history_entry_omits_brief_excerpts(self, tmp_path: Path):
+        run_dir = tmp_path / "run-1"
+        run_dir.mkdir()
+        summary = {
+            "completed": True,
+            "cycles": [
+                {
+                    "cycle": 1,
+                    "issues": ["missing test"],
+                },
+                {
+                    "cycle": 2,
+                    "issues": [],
+                },
+            ],
+            "ended_at": "2026-03-11T22:00:00",
+        }
+
+        entry = mc.build_history_entry(run_dir, summary)
+
+        assert "task_excerpt" not in entry
+        assert "evaluation_excerpt" not in entry
+        assert entry["next_run_notes"] == ["Reuse this prompt structure; the run converged successfully."]
+
+
 class TestBootstrapWorkspace:
     def test_init_workspace_creates_files(self, tmp_path: Path):
         created = bootstrap.init_workspace(tmp_path)
@@ -1123,7 +1182,9 @@ class TestBootstrapWorkspace:
         assert (workspace_dir / "runs").exists()
         assert (workspace_dir / "memory").exists()
         assert len(created) == 3 + len(mc.REQUIRED_STAGES)
-        assert 'template_file = "templates/stages/plan.md"' in (workspace_dir / "config.toml").read_text()
+        config_text = (workspace_dir / "config.toml").read_text()
+        assert 'template_file = "templates/stages/plan.md"' in config_text
+        assert "history_limit = 2" in config_text
 
     def test_init_workspace_refuses_to_overwrite_without_force(self, tmp_path: Path):
         bootstrap.init_workspace(tmp_path)

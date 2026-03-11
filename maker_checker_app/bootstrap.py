@@ -41,7 +41,7 @@ def build_default_config_text() -> str:
         max_cycles = 3
         artifacts_dir = "runs"
         history_dir = "memory"
-        history_limit = 3
+        history_limit = 2
 
         [inputs]
         task_prompt_file = "briefs/task.md"

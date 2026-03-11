@@ -63,14 +63,24 @@ def render_history_context(entries: list[dict[str, Any]], limit: int) -> str:
     lines: list[str] = []
     for entry in entries[-limit:]:
         lines.append(f"### {entry['run_id']}")
-        lines.append(f"- Outcome: {entry['outcome']}")
-        lines.append(f"- Issue trend: {entry.get('issue_trend', 'n/a')}")
-        for item in entry.get("improvements", [])[:2]:
-            lines.append(f"- Improved: {item}")
-        for item in entry.get("failures", [])[:2]:
-            lines.append(f"- Failed: {item}")
-        for item in entry.get("next_run_notes", [])[:2]:
-            lines.append(f"- Reuse: {item}")
+        lines.append(
+            f"- Outcome: {entry.get('outcome', 'unknown')}; "
+            f"Issue trend: {entry.get('issue_trend', 'n/a')}"
+        )
+        takeaway = next(
+            (
+                item
+                for item in [
+                    *(entry.get("next_run_notes", [])[:1]),
+                    *(entry.get("failures", [])[:1]),
+                    *(entry.get("improvements", [])[:1]),
+                ]
+                if item
+            ),
+            None,
+        )
+        if takeaway:
+            lines.append(f"- Carry forward: {shorten_text(takeaway, limit=140)}")
         lines.append("")
     return "\n".join(lines).strip()
 
@@ -414,8 +424,6 @@ def build_cycle_notes(cycles: list[dict[str, Any]]) -> tuple[list[str], list[str
 def build_history_entry(
     run_dir: Path,
     summary: dict[str, Any],
-    task_prompt: str,
-    evaluation_prompt: str,
 ) -> dict[str, Any]:
     cycles = summary.get("cycles", [])
     improvements, failures = build_cycle_notes(cycles)
@@ -453,8 +461,6 @@ def build_history_entry(
     return {
         "run_id": run_dir.name,
         "outcome": outcome,
-        "task_excerpt": shorten_text(task_prompt),
-        "evaluation_excerpt": shorten_text(evaluation_prompt),
         "issue_trend": issue_trend,
         "improvements": dedupe_preserve_order(improvements)[:4],
         "failures": dedupe_preserve_order(failures)[:4],
@@ -477,7 +483,7 @@ def write_history_files(history_dir: Path, entries: list[dict[str, Any]]) -> Non
     lines = [
         "# Run History",
         "",
-        "This file captures what each run tried, what improved, and what should carry into the next run.",
+        "This file captures the compact carry-forward notes from prior runs.",
         "",
     ]
     if not entries:
@@ -485,8 +491,6 @@ def write_history_files(history_dir: Path, entries: list[dict[str, Any]]) -> Non
     for entry in entries:
         lines.append(f"## {entry['run_id']}")
         lines.append(f"- Outcome: {entry['outcome']}")
-        lines.append(f"- Task brief: {entry['task_excerpt']}")
-        lines.append(f"- Evaluation brief: {entry['evaluation_excerpt']}")
         lines.append(f"- Issue trend: {entry['issue_trend']}")
         if entry.get("improvements"):
             lines.append("- Improvements:")
@@ -958,7 +962,7 @@ def finalize_run(
         active_stage=active_stage,
     )
 
-    history_entry = build_history_entry(run_dir, summary, task_prompt, evaluation_prompt)
+    history_entry = build_history_entry(run_dir, summary)
     write_run_summary(
         config=config,
         run_dir=run_dir,
