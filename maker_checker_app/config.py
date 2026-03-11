@@ -11,11 +11,17 @@ except ModuleNotFoundError:  # pragma: no cover
 
 from .models import (
     DEFAULT_EVALUATION_BRIEF,
+    DEFAULT_GIT_BASE_REF,
+    DEFAULT_GIT_MODE,
     DEFAULT_HISTORY_DIR,
     DEFAULT_HISTORY_LIMIT,
     DEFAULT_TASK_BRIEF,
+    DEFAULT_WORKSPACE_DIRNAME,
+    DEFAULT_WORKTREES_DIRNAME,
+    GIT_MODES,
     REQUIRED_STAGES,
     AgentConfig,
+    GitConfig,
     StageConfig,
     WorkflowConfig,
     WorkflowError,
@@ -59,6 +65,11 @@ def load_config(config_path: Path) -> WorkflowConfig:
     inputs_raw = raw.get("inputs", {})
     agents_raw = raw.get("agents", {})
     stages_raw = raw.get("stages", {})
+    git_raw = raw.get("git", {})
+
+    workspace_dir = base_dir if base_dir.name == DEFAULT_WORKSPACE_DIRNAME else (base_dir / DEFAULT_WORKSPACE_DIRNAME)
+    workspace_dir = workspace_dir.resolve()
+    project_dir = base_dir.parent.resolve() if base_dir.name == DEFAULT_WORKSPACE_DIRNAME else base_dir
 
     try:
         max_cycles = int(workflow_raw.get("max_cycles", 3))
@@ -131,6 +142,24 @@ def load_config(config_path: Path) -> WorkflowConfig:
             timeout_sec=int(timeout_sec) if timeout_sec is not None else None,
         )
 
+    git_mode = git_raw.get("mode", DEFAULT_GIT_MODE)
+    if not isinstance(git_mode, str) or git_mode not in GIT_MODES:
+        raise WorkflowError(
+            f"git.mode must be one of {', '.join(repr(mode) for mode in GIT_MODES)}, got {git_mode!r}."
+        )
+
+    git_base_ref = git_raw.get("base_ref", DEFAULT_GIT_BASE_REF)
+    if not isinstance(git_base_ref, str) or not git_base_ref.strip():
+        raise WorkflowError("git.base_ref must be a non-empty string.")
+
+    git_worktrees_dir_raw = git_raw.get("worktrees_dir")
+    if git_worktrees_dir_raw is None:
+        git_worktrees_dir = (workspace_dir / DEFAULT_WORKTREES_DIRNAME).resolve()
+    elif isinstance(git_worktrees_dir_raw, str) and git_worktrees_dir_raw.strip():
+        git_worktrees_dir = _resolve_path(git_worktrees_dir_raw, base_dir)
+    else:
+        raise WorkflowError("git.worktrees_dir must be a non-empty string if provided.")
+
     return WorkflowConfig(
         max_cycles=max_cycles,
         artifacts_dir=artifacts_dir,
@@ -140,4 +169,11 @@ def load_config(config_path: Path) -> WorkflowConfig:
         stages=stages,
         history_dir=history_dir,
         history_limit=history_limit,
+        workspace_dir=workspace_dir,
+        project_dir=project_dir,
+        git=GitConfig(
+            mode=git_mode,
+            base_ref=git_base_ref.strip(),
+            worktrees_dir=git_worktrees_dir,
+        ),
     )

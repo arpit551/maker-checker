@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +13,10 @@ DEFAULT_TASK_BRIEF = "briefs/task.md"
 DEFAULT_EVALUATION_BRIEF = "briefs/evaluation.md"
 DEFAULT_HISTORY_DIR = "memory"
 DEFAULT_HISTORY_LIMIT = 2
+DEFAULT_GIT_MODE = "worktree"
+DEFAULT_GIT_BASE_REF = "HEAD"
+DEFAULT_WORKTREES_DIRNAME = "worktrees"
+GIT_MODES = ("worktree", "inplace")
 
 STATUS_PENDING = "pending"
 STATUS_RUNNING = "running"
@@ -52,6 +56,13 @@ class StageConfig:
 
 
 @dataclass
+class GitConfig:
+    mode: str = DEFAULT_GIT_MODE
+    base_ref: str = DEFAULT_GIT_BASE_REF
+    worktrees_dir: Path | None = None
+
+
+@dataclass
 class WorkflowConfig:
     max_cycles: int
     artifacts_dir: Path
@@ -61,3 +72,6 @@ class WorkflowConfig:
     stages: dict[str, StageConfig]
     history_dir: Path | None = None
     history_limit: int = DEFAULT_HISTORY_LIMIT
+    workspace_dir: Path | None = None
+    project_dir: Path | None = None
+    git: GitConfig = field(default_factory=GitConfig)

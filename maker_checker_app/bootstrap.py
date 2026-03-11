@@ -43,6 +43,11 @@ def build_default_config_text() -> str:
         history_dir = "memory"
         history_limit = 2
 
+        [git]
+        mode = "worktree"
+        base_ref = "HEAD"
+        worktrees_dir = "worktrees"
+
         [inputs]
         task_prompt_file = "briefs/task.md"
         evaluation_prompt_file = "briefs/evaluation.md"

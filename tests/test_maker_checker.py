@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
 import textwrap
 from pathlib import Path
 from unittest import mock
@@ -17,6 +19,28 @@ from maker_checker_app import bootstrap as bootstrap
 # Fixtures
 # ---------------------------------------------------------------------------
 
+GIT_ENV = {
+    **os.environ,
+    "GIT_AUTHOR_NAME": "test",
+    "GIT_AUTHOR_EMAIL": "test@example.com",
+    "GIT_COMMITTER_NAME": "test",
+    "GIT_COMMITTER_EMAIL": "test@example.com",
+}
+
+
+def init_git_repo(path: Path) -> None:
+    subprocess.run(["git", "init", "-b", "main"], cwd=path, check=True, capture_output=True, text=True)
+    subprocess.run(["git", "add", "."], cwd=path, check=True, capture_output=True, text=True)
+    subprocess.run(
+        ["git", "commit", "-m", "init"],
+        cwd=path,
+        check=True,
+        capture_output=True,
+        text=True,
+        env=GIT_ENV,
+    )
+
+
 @pytest.fixture()
 def tmp_workspace(tmp_path: Path) -> Path:
     """Create a minimal workspace with required dirs and files."""
@@ -28,7 +52,9 @@ def tmp_workspace(tmp_path: Path) -> Path:
         (tmp_path / "prompts" / "stages" / f"{stage}.txt").write_text(
             f"STAGE: {stage}\nCYCLE: {{cycle_index}}\n{{task_prompt}}\n{{recent_run_memory}}\n"
         )
+    (tmp_path / "state.txt").write_text("baseline\n")
     (tmp_path / "runs").mkdir()
+    init_git_repo(tmp_path)
     return tmp_path
 
 
@@ -122,6 +148,8 @@ class TestLoadConfig:
         cfg = mc.load_config(minimal_config_toml)
         assert cfg.max_cycles == 2
         assert cfg.history_limit == mc.DEFAULT_HISTORY_LIMIT
+        assert cfg.git.mode == mc.DEFAULT_GIT_MODE
+        assert cfg.git.base_ref == mc.DEFAULT_GIT_BASE_REF
         assert "mock" in cfg.agents
         assert set(cfg.stages.keys()) == set(mc.REQUIRED_STAGES)
 
@@ -268,6 +296,7 @@ class TestLoadConfig:
         assert loaded.task_prompt_file == (tmp_path / "briefs" / "task.md").resolve()
         assert loaded.evaluation_prompt_file == (tmp_path / "briefs" / "evaluation.md").resolve()
         assert loaded.history_dir == (tmp_path / "memory").resolve()
+        assert loaded.git.worktrees_dir == (tmp_path / ".maker-checker" / "worktrees").resolve()
 
     def test_missing_template_paths_use_packaged_defaults(self, tmp_path: Path):
         (tmp_path / "briefs").mkdir()
@@ -713,6 +742,8 @@ class TestRunWorkflow:
         assert status_payload["recent_events"]
         assert status_payload["runtime_totals"]["seconds_running"] >= 0
         assert "latest_outputs" in status_payload
+        assert status_payload["workspace"]["mode"] == "worktree"
+        assert Path(status_payload["workspace"]["cwd"]).exists()
 
     def test_multi_cycle_convergence(self, tmp_workspace: Path):
         """Fail first cycle, pass second cycle."""
@@ -916,6 +947,116 @@ class TestRunWorkflow:
 
         assert first_run.name in prompt_text
         assert "Outcome:" in prompt_text
+
+    def test_run_executes_inside_isolated_worktree(self, tmp_workspace: Path):
+        mock_script = tmp_workspace / "mock_isolated.sh"
+        mock_script.write_text(textwrap.dedent("""\
+            #!/usr/bin/env bash
+            prompt="$(cat)"
+            stage="$(printf '%s\\n' "$prompt" | awk -F': ' '/^STAGE: / {print tolower($2); exit}')"
+            case "$stage" in
+              execute)
+                printf 'changed\\n' >> state.txt
+                echo "executed in $(pwd)"
+                ;;
+              verify|evaluate) echo '{"pass": true, "issues": []}' ;;
+              *) echo "output for $stage" ;;
+            esac
+        """))
+        mock_script.chmod(0o755)
+
+        cfg = mc.WorkflowConfig(
+            max_cycles=1,
+            artifacts_dir=tmp_workspace / "runs",
+            task_prompt_file=tmp_workspace / "inputs" / "task_prompt.txt",
+            evaluation_prompt_file=tmp_workspace / "inputs" / "evaluation_prompt.txt",
+            agents={"mock": mc.AgentConfig(
+                name="mock",
+                command=[str(mock_script)],
+                input_mode="stdin",
+                timeout_sec=10,
+            )},
+            stages={
+                name: mc.StageConfig(
+                    name=name,
+                    agent="mock",
+                    template_file=tmp_workspace / "prompts" / "stages" / f"{name}.txt",
+                )
+                for name in mc.REQUIRED_STAGES
+            },
+        )
+
+        run_dir = mc.run_workflow(cfg, run_name="isolated")
+        summary = json.loads((run_dir / "summary.json").read_text())
+        worktree_path = Path(summary["workspace"]["cwd"])
+
+        assert summary["workspace"]["mode"] == "worktree"
+        assert worktree_path != tmp_workspace
+        assert (tmp_workspace / "state.txt").read_text() == "baseline\n"
+        assert (worktree_path / "state.txt").read_text() == "baseline\nchanged\n"
+
+    def test_regressed_cycle_rolls_back_worktree(self, tmp_workspace: Path):
+        mock_script = tmp_workspace / "mock_regress.sh"
+        mock_script.write_text(textwrap.dedent("""\
+            #!/usr/bin/env bash
+            prompt="$(cat)"
+            stage="$(printf '%s\\n' "$prompt" | awk -F': ' '/^STAGE: / {print tolower($2); exit}')"
+            cycle="$(printf '%s\\n' "$prompt" | awk -F': ' '/^CYCLE: / {print $2; exit}')"
+            case "$stage" in
+              execute)
+                printf 'cycle%s\\n' "$cycle" > state.txt
+                echo "executed cycle $cycle"
+                ;;
+              verify)
+                if [ "$cycle" = "1" ]; then
+                  echo '{"pass": false, "issues": ["still broken"]}'
+                else
+                  echo '{"pass": false, "issues": ["still broken", "new regression", "another regression"]}'
+                fi
+                ;;
+              evaluate)
+                if [ "$cycle" = "1" ]; then
+                  echo '{"pass": false, "issues": ["still broken"]}'
+                else
+                  echo '{"pass": false, "issues": ["still broken", "new regression", "another regression"]}'
+                fi
+                ;;
+              *) echo "output for $stage cycle $cycle" ;;
+            esac
+        """))
+        mock_script.chmod(0o755)
+
+        cfg = mc.WorkflowConfig(
+            max_cycles=2,
+            artifacts_dir=tmp_workspace / "runs",
+            task_prompt_file=tmp_workspace / "inputs" / "task_prompt.txt",
+            evaluation_prompt_file=tmp_workspace / "inputs" / "evaluation_prompt.txt",
+            agents={"mock": mc.AgentConfig(
+                name="mock",
+                command=[str(mock_script)],
+                input_mode="stdin",
+                timeout_sec=10,
+            )},
+            stages={
+                name: mc.StageConfig(
+                    name=name,
+                    agent="mock",
+                    template_file=tmp_workspace / "prompts" / "stages" / f"{name}.txt",
+                )
+                for name in mc.REQUIRED_STAGES
+            },
+        )
+
+        run_dir = mc.run_workflow(cfg, run_name="regress")
+        summary = json.loads((run_dir / "summary.json").read_text())
+        worktree_path = Path(summary["workspace"]["cwd"])
+
+        assert summary["completed"] is False
+        assert summary["cycles"][1]["accepted"] is False
+        assert "reverted_to_commit" in summary["cycles"][1]
+        assert summary["workspace"]["rollbacks"]
+        assert (tmp_workspace / "state.txt").read_text() == "baseline\n"
+        assert (worktree_path / "state.txt").read_text() == "cycle1\n"
 
 
 class TestDashboardHelpers:
@@ -1183,6 +1324,9 @@ class TestBootstrapWorkspace:
         assert (workspace_dir / "memory").exists()
         assert len(created) == 3 + len(mc.REQUIRED_STAGES)
         config_text = (workspace_dir / "config.toml").read_text()
+        assert '[git]' in config_text
+        assert 'mode = "worktree"' in config_text
+        assert 'worktrees_dir = "worktrees"' in config_text
         assert 'template_file = "templates/stages/plan.md"' in config_text
         assert "history_limit = 2" in config_text
 

@@ -67,6 +67,9 @@ maker-checker run
 
 By default `maker-checker run` starts the dashboard and the workflow together. The dashboard is served on `http://127.0.0.1:8765` while the loop is running.
 
+By default the workflow runs in a disposable git worktree, not in your main checkout.
+Each run gets its own branch and working directory under `.maker-checker/worktrees/`.
+
 To run the workflow without the dashboard:
 
 ```bash
@@ -93,6 +96,18 @@ The package ships built-in default briefs and stage templates, but the intended 
 The generated config points at the local `.maker-checker/templates/stages/*.md` files, so edits there take effect immediately on the next run.
 The package defaults under `maker_checker_app/defaults/` are the seed source of truth; there is no separate repo-root scaffold to maintain anymore.
 
+## Git Isolation
+
+The default execution mode is git-isolated:
+
+- `maker-checker run` creates a dedicated branch and worktree for that run
+- all stage commands execute inside that worktree
+- the main checkout stays untouched
+- each cycle is checkpointed inside the run branch
+- if a later cycle clearly regresses, the runner resets the worktree back to the last accepted checkpoint
+
+This means the loop can iterate aggressively without repeatedly dirtying your main branch.
+
 ## Layout
 
 Inside `.maker-checker/`:
@@ -107,6 +122,7 @@ Inside `.maker-checker/`:
 - `runs/latest_summary.md`: latest run summary
 - `memory/run_history.md`: human-readable carry-forward notes
 - `memory/run_history.jsonl`: structured carry-forward notes
+- `worktrees/<run-id>/`: disposable per-run git worktrees
 
 Each run directory also contains:
 
@@ -145,6 +161,8 @@ Compatibility aliases under `/api/*` still exist.
 
 - Default config path: `.maker-checker/config.toml`
 - Default history window: the latest 2 runs, rendered as compact carry-forward notes
+- Default git mode: isolated `worktree`
+- `maker-checker run` expects to be inside a git repository with a committed `HEAD`
 - `input_mode = "stdin"` sends the rendered stage prompt via stdin
 - `input_mode = "file"` injects `{prompt_file}` into the command
 - Available placeholders: `{prompt_file}`, `{output_file}`, `{stage_dir}`, `{session_id}`

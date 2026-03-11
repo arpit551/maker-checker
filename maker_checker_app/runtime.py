@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shlex
 import subprocess
 import threading
@@ -11,6 +12,12 @@ from pathlib import Path
 from typing import Any
 
 from .config import get_history_dir
+from .git_ops import (
+    create_checkpoint,
+    create_run_context,
+    describe_context,
+    rollback_to_checkpoint,
+)
 from .models import (
     REQUIRED_STAGES,
     STATE_SCHEMA_VERSION,
@@ -221,6 +228,30 @@ def build_retry_reason(previous_cycle: dict[str, Any] | None) -> str | None:
     if not parts:
         return f"continuation after cycle {cycle_number}"
     return "; ".join(parts)
+
+
+def detect_cycle_regression(previous_cycle: dict[str, Any] | None, current_cycle: dict[str, Any]) -> str | None:
+    if not previous_cycle:
+        return None
+
+    previous_count = len(previous_cycle.get("issues", []))
+    current_count = len(current_cycle.get("issues", []))
+    if current_count > previous_count:
+        return (
+            f"cycle {current_cycle['cycle']} increased unresolved issues "
+            f"from {previous_count} to {current_count}"
+        )
+
+    issue_delta = current_cycle.get("issue_delta", {})
+    introduced = int(issue_delta.get("introduced_count", 0))
+    resolved = int(issue_delta.get("resolved_count", 0))
+    if current_count == previous_count and introduced > resolved:
+        return (
+            f"cycle {current_cycle['cycle']} introduced {introduced} issue(s) "
+            f"while resolving {resolved}"
+        )
+
+    return None
 
 
 def find_prompt_path(stage_dir: Path) -> str | None:
@@ -675,6 +706,7 @@ def build_status_payload(
         "latest_outputs": latest_outputs,
         "current_session": current_session,
         "active_cycle_snapshot": active_cycle_snapshot,
+        "workspace": summary.get("workspace"),
         "evaluation_state": evaluation_state,
         "what_happened": what_happened,
         "what_is_happening": what_is_happening,
@@ -733,6 +765,11 @@ def render_status_markdown(
         f"- Max cycles: {config.max_cycles}",
         f"- Task brief: {config.task_prompt_file}",
         f"- Evaluation brief: {config.evaluation_prompt_file}",
+        (
+            f"- Workspace: {payload['workspace']['mode']} @ {payload['workspace']['cwd']}"
+            if payload.get("workspace")
+            else "- Workspace: n/a"
+        ),
         f"- History log: {history_dir / 'run_history.md'}",
         "",
         "## Progress",
@@ -859,6 +896,11 @@ def render_run_summary_markdown(
         f"- Reported tokens: {token_total}" if token_total else "- Reported tokens: not reported",
         f"- Task brief: {shorten_text(task_prompt)}",
         f"- Evaluation brief: {shorten_text(evaluation_prompt)}",
+        (
+            f"- Workspace: {summary['workspace']['mode']} @ {summary['workspace']['cwd']}"
+            if summary.get("workspace")
+            else "- Workspace: n/a"
+        ),
         f"- Status view: {run_dir / 'status.md'}",
         f"- History log: {get_history_dir(config) / 'run_history.md'}",
         "",
@@ -980,12 +1022,17 @@ def run_stage(
     prompt: str,
     stage_dir: Path,
     invocation: dict[str, Any] | None = None,
+    cwd: Path | None = None,
+    extra_env: dict[str, str] | None = None,
 ) -> tuple[str, float]:
     invocation = invocation or prepare_stage_run(stage, agent, prompt, stage_dir)
     output_file = Path(invocation["output_file"])
     command = list(invocation["command"])
 
     timeout = stage.timeout_sec or agent.timeout_sec
+    env = os.environ.copy()
+    if extra_env:
+        env.update(extra_env)
 
     t0 = time.monotonic()
     proc: subprocess.Popen[str] | None = None
@@ -996,6 +1043,8 @@ def run_stage(
     try:
         proc = subprocess.Popen(
             command,
+            cwd=str(cwd) if cwd is not None else None,
+            env=env,
             stdin=subprocess.PIPE if agent.input_mode == "stdin" else None,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -1106,6 +1155,9 @@ def run_workflow(config: WorkflowConfig, run_name: str | None = None) -> Path:
     suffix = f"-{run_name}" if run_name else ""
     run_dir = config.artifacts_dir / f"{timestamp}{suffix}"
     run_dir.mkdir(parents=True, exist_ok=False)
+    project_dir = (config.project_dir or config.artifacts_dir.parent).resolve()
+    git_context = create_run_context(project_dir, config.git, run_dir.name)
+    execution_cwd = git_context.cwd.resolve()
 
     task_prompt = read_text_file(config.task_prompt_file, "Task brief file")
     evaluation_prompt = read_text_file(config.evaluation_prompt_file, "Evaluation brief file")
@@ -1132,10 +1184,15 @@ def run_workflow(config: WorkflowConfig, run_name: str | None = None) -> Path:
         "completed": False,
         "failure": None,
         "history_loaded": bool(history_entries),
+        "workspace": describe_context(git_context),
     }
     progress = init_progress(config.max_cycles)
     current_plan = ""
     append_event(run_dir, "run created")
+    append_event(
+        run_dir,
+        f"workspace ready in {execution_cwd} from {git_context.base_ref} ({git_context.base_commit})",
+    )
 
     write_status_files(
         config=config,
@@ -1165,6 +1222,7 @@ def run_workflow(config: WorkflowConfig, run_name: str | None = None) -> Path:
                 context = build_cycle_context(base_context, stage_outputs, cycle, config.max_cycles)
                 prompt = render_prompt(stage.template_file, context)
                 invocation = prepare_stage_run(stage, agent, prompt, stage_dir)
+                (stage_dir / "cwd.txt").write_text(str(execution_cwd), encoding="utf-8")
                 session_ids[stage_name] = invocation["session_id"]
 
                 progress[cycle][stage_name] = STATUS_RUNNING
@@ -1180,7 +1238,22 @@ def run_workflow(config: WorkflowConfig, run_name: str | None = None) -> Path:
 
                 print(f"[cycle {cycle}] {stage_name} -> {agent.name}")
                 append_event(run_dir, f"cycle {cycle} stage {stage_name} started via {agent.name}")
-                output, elapsed = run_stage(stage, agent, prompt, stage_dir, invocation=invocation)
+                output, elapsed = run_stage(
+                    stage,
+                    agent,
+                    prompt,
+                    stage_dir,
+                    invocation=invocation,
+                    cwd=execution_cwd,
+                    extra_env={
+                        "MAKER_CHECKER_RUN_ID": run_dir.name,
+                        "MAKER_CHECKER_PROJECT_DIR": str(project_dir),
+                        "MAKER_CHECKER_WORKSPACE_DIR": str(config.workspace_dir or ""),
+                        "MAKER_CHECKER_EXECUTION_CWD": str(execution_cwd),
+                        "MAKER_CHECKER_GIT_MODE": git_context.mode,
+                        "MAKER_CHECKER_GIT_BRANCH": git_context.branch or "",
+                    },
+                )
                 stage_outputs[stage_name] = output
                 stage_timings[stage_name] = elapsed
                 progress[cycle][stage_name] = STATUS_COMPLETED
@@ -1200,6 +1273,18 @@ def run_workflow(config: WorkflowConfig, run_name: str | None = None) -> Path:
         except WorkflowError as exc:
             progress[cycle][stage_name] = STATUS_FAILED
             failed_stage_dir = cycle_dir / f"{step_index:02d}-{stage_name}"
+            if git_context.mode == "worktree" and git_context.current_checkpoint:
+                rollback_to_checkpoint(
+                    git_context,
+                    git_context.current_checkpoint,
+                    f"stage failure in cycle {cycle} / {stage_name}",
+                    cycle,
+                )
+                summary["workspace"] = describe_context(git_context)
+                append_event(
+                    run_dir,
+                    f"workspace rolled back to {git_context.current_checkpoint} after stage failure",
+                )
             summary["failure"] = {
                 "cycle": cycle,
                 "attempt": cycle,
@@ -1259,7 +1344,28 @@ def run_workflow(config: WorkflowConfig, run_name: str | None = None) -> Path:
             "stage_timings_sec": stage_timings,
             "session_ids": session_ids,
         }
+        regression_reason = detect_cycle_regression(previous_cycle, cycle_record)
+        if git_context.mode == "worktree":
+            previous_checkpoint = git_context.current_checkpoint
+            checkpoint_commit = create_checkpoint(git_context, f"cycle-{cycle}")
+            cycle_record["checkpoint_commit"] = checkpoint_commit
+            if regression_reason and previous_checkpoint:
+                rollback_to_checkpoint(git_context, previous_checkpoint, regression_reason, cycle)
+                cycle_record["accepted"] = False
+                cycle_record["regression_reason"] = regression_reason
+                cycle_record["reverted_to_commit"] = previous_checkpoint
+                append_event(
+                    run_dir,
+                    f"cycle {cycle} regressed; workspace rolled back to {previous_checkpoint}",
+                )
+            else:
+                cycle_record["accepted"] = True
+        else:
+            cycle_record["accepted"] = regression_reason is None
+            if regression_reason:
+                cycle_record["regression_reason"] = regression_reason
         summary["cycles"].append(cycle_record)
+        summary["workspace"] = describe_context(git_context)
 
         (cycle_dir / "issues.json").write_text(
             json.dumps(
