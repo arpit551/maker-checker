@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Maker Checker Run Room</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <div class="shell">
+    <header class="hero">
+      <div>
+        <div class="eyebrow">Maker Checker Dashboard</div>
+        <h1>Run Room</h1>
+        <p>Each run opens as a collapsible workspace with stage pills and dedicated tabs for output, prompt, logs, summary, and live execution.</p>
+      </div>
+      <div class="hero-meta">
+        <div class="pill">Auto refresh <span id="refreshTick">2s</span></div>
+        <div class="pill subtle" id="runsMeta">0 runs</div>
+      </div>
+    </header>
+
+    <main class="content">
+      <section class="panel">
+        <div class="panel-head">
+          <div>
+            <h2>Runs</h2>
+            <p class="panel-copy">Open a run to inspect the latest or active cycle, then switch between stage-specific views.</p>
+          </div>
+        </div>
+        <div id="runAccordions" class="run-accordions"></div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <div>
+            <h2>Recent Learnings</h2>
+            <p class="panel-copy">Carry-forward notes from the last completed runs.</p>
+          </div>
+        </div>
+        <div id="historyCards" class="history-cards"></div>
+      </section>
+    </main>
+  </div>
+
+  <script type="module" src="/static/app.js"></script>
+</body>
+</html>
