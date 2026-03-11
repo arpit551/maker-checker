@@ -10,6 +10,7 @@ import pytest
 
 import maker_checker as mc
 from maker_checker_app import dashboard as dash
+from maker_checker_app import bootstrap as bootstrap
 
 
 # ---------------------------------------------------------------------------
@@ -267,6 +268,43 @@ class TestLoadConfig:
         assert loaded.evaluation_prompt_file == (tmp_path / "briefs" / "evaluation.md").resolve()
         assert loaded.history_dir == (tmp_path / "memory").resolve()
 
+    def test_missing_template_paths_use_packaged_defaults(self, tmp_path: Path):
+        (tmp_path / "briefs").mkdir()
+        (tmp_path / "briefs" / "task.md").write_text("task\n")
+        (tmp_path / "briefs" / "evaluation.md").write_text("eval\n")
+
+        cfg = tmp_path / "config.toml"
+        cfg.write_text(textwrap.dedent("""\
+            [workflow]
+            max_cycles = 1
+
+            [agents.a]
+            command = "echo hi"
+
+            [stages.plan]
+            agent = "a"
+
+            [stages.critique]
+            agent = "a"
+
+            [stages.revise]
+            agent = "a"
+
+            [stages.execute]
+            agent = "a"
+
+            [stages.verify]
+            agent = "a"
+
+            [stages.evaluate]
+            agent = "a"
+        """))
+
+        loaded = mc.load_config(cfg)
+        for stage_name in mc.REQUIRED_STAGES:
+            assert loaded.stages[stage_name].template_file.exists()
+            assert f"/defaults/templates/stages/{stage_name}.md" in str(loaded.stages[stage_name].template_file)
+
 
 # ---------------------------------------------------------------------------
 # read_text_file
@@ -353,6 +391,32 @@ class TestExtractFirstJson:
     def test_invalid_json_skipped(self):
         result = mc.extract_first_json('{bad} {"good": true}')
         assert result == {"good": True}
+
+
+# ---------------------------------------------------------------------------
+# extract_token_totals / extract_reported_session_id
+# ---------------------------------------------------------------------------
+
+class TestRuntimeMetadataParsing:
+    def test_extract_token_totals_from_nested_usage(self):
+        value = '{"usage":{"input_tokens":12,"output_tokens":8,"total_tokens":20}}'
+        assert mc.extract_token_totals(value) == {
+            "input_tokens": 12,
+            "output_tokens": 8,
+            "total_tokens": 20,
+        }
+
+    def test_extract_token_totals_supports_prompt_completion_aliases(self):
+        value = '{"prompt_tokens":5,"completion_tokens":7}'
+        assert mc.extract_token_totals(value) == {
+            "input_tokens": 5,
+            "output_tokens": 7,
+            "total_tokens": 12,
+        }
+
+    def test_extract_reported_session_id_from_text(self):
+        value = "session id: abc-123-session"
+        assert mc.extract_reported_session_id(value) == "abc-123-session"
 
 
 # ---------------------------------------------------------------------------
@@ -458,6 +522,19 @@ class TestBuildCycleContext:
 
 
 # ---------------------------------------------------------------------------
+# build_issue_delta
+# ---------------------------------------------------------------------------
+
+class TestBuildIssueDelta:
+    def test_build_issue_delta_tracks_resolved_and_introduced(self):
+        delta = mc.build_issue_delta(["a", "b"], ["b", "c"])
+        assert delta["resolved"] == ["a"]
+        assert delta["introduced"] == ["c"]
+        assert delta["persistent"] == ["b"]
+        assert delta["summary"] == "resolved 1, introduced 1, carried 1"
+
+
+# ---------------------------------------------------------------------------
 # run_stage
 # ---------------------------------------------------------------------------
 
@@ -542,6 +619,32 @@ class TestRunStage:
         assert saved == elapsed
         assert elapsed >= 0
 
+    def test_stream_logs_written_to_files(self, tmp_path: Path):
+        script = tmp_path / "stream.sh"
+        script.write_text(textwrap.dedent("""\
+            #!/usr/bin/env bash
+            printf 'stdout line 1\\n'
+            printf 'stderr line 1\\n' >&2
+            printf 'assistant payload\\n' > "$1"
+        """))
+        script.chmod(0o755)
+
+        stage = mc.StageConfig(name="test", agent="a", template_file=Path("x"))
+        agent = mc.AgentConfig(
+            name="a",
+            command=[str(script), "{output_file}"],
+            input_mode="stdin",
+            timeout_sec=5,
+        )
+        stage_dir = tmp_path / "stage"
+        output, _ = mc.run_stage(stage, agent, "prompt", stage_dir)
+        assert output == "assistant payload"
+        assert "stdout line 1" in (stage_dir / "stdout.txt").read_text()
+        assert "stderr line 1" in (stage_dir / "stderr.txt").read_text()
+        combined = (stage_dir / "combined.log").read_text()
+        assert "[stdout] stdout line 1" in combined
+        assert "[stderr] stderr line 1" in combined
+
 
 # ---------------------------------------------------------------------------
 # run_workflow
@@ -601,11 +704,14 @@ class TestRunWorkflow:
         assert (tmp_workspace / "memory" / "run_history.md").exists()
         assert (tmp_workspace / "runs" / "latest_status.md").exists()
         assert (tmp_workspace / "runs" / "latest_status.json").exists()
+        assert (tmp_workspace / "runs" / "runtime_state.json").exists()
         assert (tmp_workspace / "runs" / "latest_summary.md").exists()
         status_payload = json.loads((run_dir / "status.json").read_text())
         assert status_payload["run_id"] == run_dir.name
         assert status_payload["stage_position"]["total"] == len(mc.REQUIRED_STAGES)
         assert status_payload["recent_events"]
+        assert status_payload["runtime_totals"]["seconds_running"] >= 0
+        assert "latest_outputs" in status_payload
 
     def test_multi_cycle_convergence(self, tmp_workspace: Path):
         """Fail first cycle, pass second cycle."""
@@ -662,6 +768,9 @@ class TestRunWorkflow:
         assert len(summary["cycles"]) == 2
         assert summary["cycles"][0]["evaluate_pass"] is False
         assert summary["cycles"][1]["evaluate_pass"] is True
+        assert summary["cycles"][1]["retry_reason"] == "cycle 1 left 2 unresolved issue(s); verify failed; evaluate failed"
+        assert summary["cycles"][1]["issue_delta"]["resolved"] == ["not done yet", "missing tests"]
+        assert summary["cycles"][1]["issue_delta"]["introduced"] == []
         assert summary["history_file"].endswith("run_history.md")
 
     def test_stage_failure_writes_summary(self, tmp_workspace: Path):
@@ -846,11 +955,47 @@ class TestDashboardHelpers:
         run_dir = mc.run_workflow(cfg, run_name="dash")
         runs = dash.list_runs(cfg)
         status = dash.load_status(cfg, run_dir.name)
+        state = dash.build_state_payload(cfg)
 
         assert runs[0]["run_id"] == run_dir.name
         assert status["run_id"] == run_dir.name
         assert status["evaluation_state"]["evaluate_pass"] is True
         assert status["what_happened"]
+        assert state["current_run"]["run_id"] == run_dir.name
+        assert state["runs"][0]["run_id"] == run_dir.name
+        assert "summary_markdown" in status
+        stage_detail = dash.load_stage_detail(cfg, run_dir.name, 1, "plan")
+        stage_logs = dash.load_stage_logs(cfg, run_dir.name, 1, "plan")
+        assert stage_detail["content"]["primary_output"] == "output for plan\n"
+        assert stage_detail["content"]["stdout"] == "output for plan\n"
+        assert "STAGE: plan" in stage_detail["content"]["prompt"]
+        assert "output for plan" in stage_logs["streams"]["stdout"]["text"]
+        assert "[stdout]" in stage_logs["streams"]["combined"]["text"]
+
+    def test_pending_stage_detail_returns_empty_payload(self, tmp_workspace: Path):
+        cfg = mc.WorkflowConfig(
+            max_cycles=1,
+            artifacts_dir=tmp_workspace / "runs",
+            task_prompt_file=tmp_workspace / "inputs" / "task_prompt.txt",
+            evaluation_prompt_file=tmp_workspace / "inputs" / "evaluation_prompt.txt",
+            agents={"mock": mc.AgentConfig(
+                name="mock",
+                command=["false"],
+                input_mode="stdin",
+                timeout_sec=1,
+            )},
+            stages={
+                name: mc.StageConfig(
+                    name=name,
+                    agent="mock",
+                    template_file=tmp_workspace / "prompts" / "stages" / f"{name}.txt",
+                )
+                for name in mc.REQUIRED_STAGES
+            },
+        )
+
+        status = dash.build_idle_run_detail(cfg)
+        assert status["state"] == "idle"
 
 
 # ---------------------------------------------------------------------------
@@ -914,3 +1059,24 @@ class TestMain:
             "--history-limit", "0",
         ]):
             assert mc.main() == 1
+
+
+class TestBootstrapWorkspace:
+    def test_init_workspace_creates_files(self, tmp_path: Path):
+        created = bootstrap.init_workspace(tmp_path)
+        assert (tmp_path / "config.toml").exists()
+        assert (tmp_path / "briefs" / "task.md").exists()
+        assert (tmp_path / "briefs" / "evaluation.md").exists()
+        assert (tmp_path / "runs").exists()
+        assert (tmp_path / "memory").exists()
+        assert len(created) == 3
+
+    def test_init_workspace_refuses_to_overwrite_without_force(self, tmp_path: Path):
+        bootstrap.init_workspace(tmp_path)
+        with pytest.raises(mc.WorkflowError, match="Refusing to overwrite existing files"):
+            bootstrap.init_workspace(tmp_path)
+
+    def test_bootstrap_main_returns_1_on_overwrite_conflict(self, tmp_path: Path):
+        bootstrap.init_workspace(tmp_path)
+        with mock.patch("sys.argv", ["maker-checker-init", str(tmp_path)]):
+            assert bootstrap.main() == 1
