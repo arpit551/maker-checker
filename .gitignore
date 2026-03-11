@@ -1,0 +1,8 @@
+.pytest_cache/
+.venv/
+__pycache__/
+*.pyc
+
+runs/
+memory/run_history.jsonl
+memory/run_history.md
