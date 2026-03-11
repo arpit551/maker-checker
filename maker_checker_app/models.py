@@ -7,6 +7,8 @@ from typing import Any
 
 REQUIRED_STAGES = ("plan", "critique", "revise", "execute", "verify", "evaluate")
 STATE_SCHEMA_VERSION = "v1"
+DEFAULT_WORKSPACE_DIRNAME = ".maker-checker"
+DEFAULT_CONFIG_FILE = f"{DEFAULT_WORKSPACE_DIRNAME}/config.toml"
 DEFAULT_TASK_BRIEF = "briefs/task.md"
 DEFAULT_EVALUATION_BRIEF = "briefs/evaluation.md"
 DEFAULT_HISTORY_DIR = "memory"

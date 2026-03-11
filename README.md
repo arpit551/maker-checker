@@ -1,92 +1,111 @@
 # maker-checker
 
-`maker-checker` runs a maker-checker loop across six stages:
+`maker-checker` runs a six-stage maker-checker loop:
 
-1. Codex plans.
-2. Claude critiques.
-3. Codex revises.
-4. Claude executes.
-5. Codex verifies.
-6. Codex evaluates.
+1. Codex plans
+2. Claude critiques
+3. Codex revises
+4. Claude executes
+5. Codex verifies
+6. Codex evaluates
 
-Each run records artifacts, carry-forward history, and a live dashboard view so the next cycle can reuse what already worked and avoid repeating known failures.
+The default user workflow is centered on a hidden project-local workspace at `.maker-checker/`. That folder holds the editable config, briefs, templates, run artifacts, and dashboard state.
 
 ## Install
 
-Install from source:
+One-line install from GitHub:
+
+```bash
+uv tool install git+https://github.com/arpit551/maker-checker.git
+```
+
+Alternative with `pipx`:
+
+```bash
+pipx install git+https://github.com/arpit551/maker-checker.git
+```
+
+Source install still works:
 
 ```bash
 pip install .
 ```
 
-Or build a wheel first:
+## Commands
 
-```bash
-uv build --wheel
-pip install dist/maker_checker-0.1.0-py3-none-any.whl
-```
+- `maker-checker init`
+- `maker-checker run`
+- `maker-checker dashboard`
 
-Installed commands:
+Compatibility entrypoints also exist:
 
-- `maker-checker`: run the workflow
-- `maker-checker-dashboard`: serve the local dashboard
-- `maker-checker-init`: scaffold a workspace with config and briefs
-
-The source-tree entrypoints `python3 maker_checker.py` and `python3 dashboard.py` still work when you are running directly from a checkout.
+- `maker-checker-init`
+- `maker-checker-dashboard`
 
 ## Quick Start
 
-Create a workspace:
+From any project directory:
 
 ```bash
-mkdir my-maker-checker
-cd my-maker-checker
-maker-checker-init
+maker-checker init
 ```
 
 That creates:
 
+- `.maker-checker/config.toml`
+- `.maker-checker/briefs/task.md`
+- `.maker-checker/briefs/evaluation.md`
+- `.maker-checker/templates/stages/*.md`
+- `.maker-checker/runs/`
+- `.maker-checker/memory/`
+
+Edit the local files in `.maker-checker/` as needed, then run:
+
+```bash
+maker-checker run
+```
+
+By default `maker-checker run` starts the dashboard and the workflow together. The dashboard is served on `http://127.0.0.1:8765` while the loop is running.
+
+To run the workflow without the dashboard:
+
+```bash
+maker-checker run --no-dashboard
+```
+
+To serve the dashboard separately against the saved run state:
+
+```bash
+maker-checker dashboard
+```
+
+## Hidden Workspace Model
+
+The package ships built-in default briefs and stage templates, but the intended override point is `.maker-checker/`.
+
+`maker-checker init` copies all of these into `.maker-checker/` so users can edit them directly:
+
 - `config.toml`
-- `briefs/task.md`
-- `briefs/evaluation.md`
-- `runs/`
-- `memory/`
+- task brief
+- evaluation brief
+- all stage templates
 
-Edit the briefs for your task, then run:
+The generated config points at the local `.maker-checker/templates/stages/*.md` files, so edits there take effect immediately on the next run.
 
-```bash
-maker-checker --config config.toml
-```
+## Layout
 
-Start the dashboard:
+Inside `.maker-checker/`:
 
-```bash
-maker-checker-dashboard --config config.toml --port 8765
-```
-
-Then open [http://127.0.0.1:8765](http://127.0.0.1:8765).
-
-## Config Model
-
-The generated `config.toml` keeps user-owned files local to the workspace and uses packaged stage templates by default. You only need to configure:
-
-- workflow directories and cycle count
-- task and evaluation briefs
-- agent commands
-- which agent owns each stage
-
-You can still override any stage template with `template_file = "path/to/template.md"` if you want custom prompts for a specific installation.
-
-## Workspace Layout
-
-- `briefs/task.md`: the implementation brief
-- `briefs/evaluation.md`: the scoring rubric
-- `runs/latest_status.md`: latest human-readable live status
-- `runs/latest_status.json`: latest machine-readable live status
-- `runs/runtime_state.json`: dashboard-friendly state payload
-- `runs/latest_summary.md`: latest human summary
-- `memory/run_history.md`: reusable lessons from earlier runs
-- `memory/run_history.jsonl`: structured cross-run history
+- `config.toml`: local workflow config
+- `briefs/task.md`: implementation brief
+- `briefs/evaluation.md`: scoring rubric
+- `templates/stages/*.md`: editable stage prompts
+- `runs/latest_status.md`: latest live status in Markdown
+- `runs/latest_status.json`: latest live status in JSON
+- `runs/runtime_state.json`: stable dashboard/API state
+- `runs/latest_summary.md`: latest run summary
+- `memory/run_history.md`: human-readable cross-run memory
+- `memory/run_history.jsonl`: structured cross-run memory
 
 Each run directory also contains:
 
@@ -102,14 +121,12 @@ Each run directory also contains:
 
 ## Dashboard
 
-The dashboard is backed by a versioned runtime API and a packaged static frontend.
+The dashboard UI is run-centric:
 
-The UI is run-centric:
-
-- each run opens as a collapsible card
-- each open run shows stage pills for `plan`, `critique`, `revise`, `execute`, `verify`, and `evaluate`
+- each run is a collapsible card
+- each open run exposes stage pills for `plan`, `critique`, `revise`, `execute`, `verify`, and `evaluate`
 - tabs separate `Prompt`, `Logs`, `Output`, `Summary`, and `Live`
-- the live tab shows current stage context plus live log output for active runs
+- the live view shows the current stage plus live logs when a run is active
 
 API endpoints:
 
@@ -125,9 +142,9 @@ Compatibility aliases under `/api/*` still exist.
 
 ## Notes
 
-- `input_mode = "stdin"` sends the rendered stage prompt via stdin.
-- `input_mode = "file"` injects `{prompt_file}` into the command.
-- Available placeholders: `{prompt_file}`, `{output_file}`, `{stage_dir}`, `{session_id}`.
-- Recent run history is injected from `memory/run_history.md`.
-- The default scaffold expects working `codex` and `claude` CLIs with authentication already set up.
-- Internal stage templates ship inside the package, so you do not need to copy `templates/` into every workspace.
+- Default config path: `.maker-checker/config.toml`
+- `input_mode = "stdin"` sends the rendered stage prompt via stdin
+- `input_mode = "file"` injects `{prompt_file}` into the command
+- Available placeholders: `{prompt_file}`, `{output_file}`, `{stage_dir}`, `{session_id}`
+- The default scaffold expects working `codex` and `claude` CLIs with valid authentication
+- If you do not want local template overrides, you can remove `template_file` entries and fall back to the package defaults

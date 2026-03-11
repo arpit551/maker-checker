@@ -4,10 +4,12 @@ from .bootstrap import init_workspace, main as bootstrap_main, parse_args as boo
 from .cli import main, parse_args
 from .config import _ensure_list_command, get_history_dir, load_config
 from .models import (
+    DEFAULT_CONFIG_FILE,
     DEFAULT_EVALUATION_BRIEF,
     DEFAULT_HISTORY_DIR,
     DEFAULT_HISTORY_LIMIT,
     DEFAULT_TASK_BRIEF,
+    DEFAULT_WORKSPACE_DIRNAME,
     REQUIRED_STAGES,
     STATE_SCHEMA_VERSION,
     STATUS_COMPLETED,
@@ -21,7 +23,7 @@ from .models import (
     WorkflowConfig,
     WorkflowError,
 )
-from .resources import default_brief_path, default_stage_template_path
+from .resources import default_brief_path, default_stage_template_path, resolve_workspace_dir
 from .runtime import (
     append_history_entry,
     build_issue_delta,
@@ -60,9 +62,11 @@ except PackageNotFoundError:  # pragma: no cover
 
 __all__ = [
     "DEFAULT_EVALUATION_BRIEF",
+    "DEFAULT_CONFIG_FILE",
     "DEFAULT_HISTORY_DIR",
     "DEFAULT_HISTORY_LIMIT",
     "DEFAULT_TASK_BRIEF",
+    "DEFAULT_WORKSPACE_DIRNAME",
     "REQUIRED_STAGES",
     "STATE_SCHEMA_VERSION",
     "STATUS_COMPLETED",
@@ -105,6 +109,7 @@ __all__ = [
     "render_prompt",
     "render_run_summary_markdown",
     "render_status_markdown",
+    "resolve_workspace_dir",
     "run_stage",
     "run_workflow",
     "shorten_text",

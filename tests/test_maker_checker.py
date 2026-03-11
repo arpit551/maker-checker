@@ -1006,11 +1006,13 @@ class TestParseArgs:
     def test_defaults(self):
         with mock.patch("sys.argv", ["maker_checker.py"]):
             args = mc.parse_args()
-            assert args.config == "config.toml"
+            assert args.command == "run"
+            assert args.config == mc.DEFAULT_CONFIG_FILE
             assert args.task_file is None
             assert args.max_cycles is None
+            assert args.dashboard is True
 
-    def test_overrides(self):
+    def test_old_style_run_flags_still_work(self):
         with mock.patch("sys.argv", [
             "maker_checker.py",
             "--config", "other.toml",
@@ -1020,11 +1022,24 @@ class TestParseArgs:
             "--run-name", "test",
         ]):
             args = mc.parse_args()
+            assert args.command == "run"
             assert args.config == "other.toml"
             assert args.task_file == "t.txt"
             assert args.max_cycles == 7
             assert args.history_limit == 5
             assert args.run_name == "test"
+
+    def test_init_subcommand(self):
+        with mock.patch("sys.argv", ["maker_checker.py", "init", "/tmp/work"]):
+            args = mc.parse_args()
+            assert args.command == "init"
+            assert args.directory == "/tmp/work"
+
+    def test_dashboard_subcommand(self):
+        with mock.patch("sys.argv", ["maker_checker.py", "dashboard", "--port", "9999"]):
+            args = mc.parse_args()
+            assert args.command == "dashboard"
+            assert args.port == 9999
 
 
 # ---------------------------------------------------------------------------
@@ -1060,16 +1075,55 @@ class TestMain:
         ]):
             assert mc.main() == 1
 
+    def test_run_starts_dashboard_by_default(self, minimal_config_toml: Path):
+        server = mock.Mock()
+        with mock.patch("maker_checker_app.cli.run_workflow") as run_workflow_mock, mock.patch(
+            "maker_checker_app.cli.start_server_in_background",
+            return_value=(server, mock.Mock()),
+        ) as start_dashboard_mock:
+            with mock.patch("sys.argv", [
+                "maker_checker.py",
+                "--config", str(minimal_config_toml),
+            ]):
+                assert mc.main() == 0
+
+        start_dashboard_mock.assert_called_once()
+        run_workflow_mock.assert_called_once()
+        server.shutdown.assert_called_once()
+        server.server_close.assert_called_once()
+
+    def test_run_can_disable_dashboard(self, minimal_config_toml: Path):
+        with mock.patch("maker_checker_app.cli.run_workflow") as run_workflow_mock, mock.patch(
+            "maker_checker_app.cli.start_server_in_background",
+        ) as start_dashboard_mock:
+            with mock.patch("sys.argv", [
+                "maker_checker.py",
+                "--config", str(minimal_config_toml),
+                "--no-dashboard",
+            ]):
+                assert mc.main() == 0
+
+        start_dashboard_mock.assert_not_called()
+        run_workflow_mock.assert_called_once()
+
+    def test_init_command_creates_hidden_workspace(self, tmp_path: Path):
+        with mock.patch("sys.argv", ["maker_checker.py", "init", str(tmp_path)]):
+            assert mc.main() == 0
+        assert (tmp_path / ".maker-checker" / "config.toml").exists()
+
 
 class TestBootstrapWorkspace:
     def test_init_workspace_creates_files(self, tmp_path: Path):
         created = bootstrap.init_workspace(tmp_path)
-        assert (tmp_path / "config.toml").exists()
-        assert (tmp_path / "briefs" / "task.md").exists()
-        assert (tmp_path / "briefs" / "evaluation.md").exists()
-        assert (tmp_path / "runs").exists()
-        assert (tmp_path / "memory").exists()
-        assert len(created) == 3
+        workspace_dir = tmp_path / ".maker-checker"
+        assert (workspace_dir / "config.toml").exists()
+        assert (workspace_dir / "briefs" / "task.md").exists()
+        assert (workspace_dir / "briefs" / "evaluation.md").exists()
+        assert (workspace_dir / "templates" / "stages" / "plan.md").exists()
+        assert (workspace_dir / "runs").exists()
+        assert (workspace_dir / "memory").exists()
+        assert len(created) == 3 + len(mc.REQUIRED_STAGES)
+        assert 'template_file = "templates/stages/plan.md"' in (workspace_dir / "config.toml").read_text()
 
     def test_init_workspace_refuses_to_overwrite_without_force(self, tmp_path: Path):
         bootstrap.init_workspace(tmp_path)

@@ -6,10 +6,11 @@ import json
 import mimetypes
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from threading import Thread
 from urllib.parse import parse_qs, unquote, urlparse
 
 from .config import get_history_dir, load_config
-from .models import REQUIRED_STAGES, STATE_SCHEMA_VERSION, WorkflowConfig
+from .models import DEFAULT_CONFIG_FILE, REQUIRED_STAGES, STATE_SCHEMA_VERSION, WorkflowConfig
 from .runtime import load_history_entries
 
 
@@ -18,7 +19,7 @@ STATIC_DIR = Path(__file__).resolve().parent / "dashboard_static"
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Serve the local maker-checker dashboard.")
-    parser.add_argument("--config", default="config.toml", help="Path to workflow config TOML.")
+    parser.add_argument("--config", default=DEFAULT_CONFIG_FILE, help="Path to workflow config TOML.")
     parser.add_argument("--host", default="127.0.0.1", help="Host to bind.")
     parser.add_argument("--port", type=int, default=8765, help="Port to bind.")
     return parser.parse_args()
@@ -448,10 +449,21 @@ def make_handler(config: WorkflowConfig):
     return Handler
 
 
+def create_server(config: WorkflowConfig, host: str, port: int) -> ThreadingHTTPServer:
+    return ThreadingHTTPServer((host, port), make_handler(config))
+
+
+def start_server_in_background(config: WorkflowConfig, host: str, port: int) -> tuple[ThreadingHTTPServer, Thread]:
+    server = create_server(config, host, port)
+    thread = Thread(target=server.serve_forever, daemon=True, name="maker-checker-dashboard")
+    thread.start()
+    return server, thread
+
+
 def main() -> int:
     args = parse_args()
     config = load_config(Path(args.config).expanduser().resolve())
-    server = ThreadingHTTPServer((args.host, args.port), make_handler(config))
+    server = create_server(config, args.host, args.port)
     print(f"Dashboard running at http://{args.host}:{args.port}")
     try:
         server.serve_forever()
