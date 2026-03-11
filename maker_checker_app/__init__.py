@@ -1,3 +1,6 @@
+from importlib.metadata import PackageNotFoundError, version
+
+from .bootstrap import init_workspace, main as bootstrap_main, parse_args as bootstrap_parse_args
 from .cli import main, parse_args
 from .config import _ensure_list_command, get_history_dir, load_config
 from .models import (
@@ -6,6 +9,7 @@ from .models import (
     DEFAULT_HISTORY_LIMIT,
     DEFAULT_TASK_BRIEF,
     REQUIRED_STAGES,
+    STATE_SCHEMA_VERSION,
     STATUS_COMPLETED,
     STATUS_FAILED,
     STATUS_PENDING,
@@ -17,8 +21,10 @@ from .models import (
     WorkflowConfig,
     WorkflowError,
 )
+from .resources import default_brief_path, default_stage_template_path
 from .runtime import (
     append_history_entry,
+    build_issue_delta,
     build_cycle_notes,
     build_history_entry,
     finalize_run,
@@ -36,6 +42,8 @@ from .runtime import (
 from .text import (
     build_cycle_context,
     dedupe_preserve_order,
+    extract_reported_session_id,
+    extract_token_totals,
     extract_first_json,
     parse_assessment,
     read_text_file,
@@ -45,12 +53,18 @@ from .text import (
     summarize_items,
 )
 
+try:
+    __version__ = version("maker-checker")
+except PackageNotFoundError:  # pragma: no cover
+    __version__ = "0.1.0"
+
 __all__ = [
     "DEFAULT_EVALUATION_BRIEF",
     "DEFAULT_HISTORY_DIR",
     "DEFAULT_HISTORY_LIMIT",
     "DEFAULT_TASK_BRIEF",
     "REQUIRED_STAGES",
+    "STATE_SCHEMA_VERSION",
     "STATUS_COMPLETED",
     "STATUS_FAILED",
     "STATUS_PENDING",
@@ -61,15 +75,24 @@ __all__ = [
     "StageConfig",
     "WorkflowConfig",
     "WorkflowError",
+    "__version__",
     "_ensure_list_command",
     "append_history_entry",
+    "bootstrap_main",
+    "bootstrap_parse_args",
     "build_cycle_context",
+    "build_issue_delta",
     "build_cycle_notes",
     "build_history_entry",
+    "default_brief_path",
+    "default_stage_template_path",
     "dedupe_preserve_order",
+    "extract_reported_session_id",
+    "extract_token_totals",
     "extract_first_json",
     "finalize_run",
     "get_history_dir",
+    "init_workspace",
     "init_progress",
     "load_config",
     "load_history_entries",

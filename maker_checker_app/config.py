@@ -20,6 +20,7 @@ from .models import (
     WorkflowConfig,
     WorkflowError,
 )
+from .resources import default_stage_template_path
 
 
 def _resolve_path(raw: str, base_dir: Path) -> Path:
@@ -116,13 +117,17 @@ def load_config(config_path: Path) -> WorkflowConfig:
                 f"stages.{stage_name}.agent references unknown agent {agent!r}."
             )
         template_file_raw = stage_raw.get("template_file")
-        if not isinstance(template_file_raw, str) or not template_file_raw:
-            raise WorkflowError(f"stages.{stage_name}.template_file is required.")
+        if template_file_raw is None:
+            template_file = default_stage_template_path(stage_name)
+        elif isinstance(template_file_raw, str) and template_file_raw:
+            template_file = _resolve_path(template_file_raw, base_dir)
+        else:
+            raise WorkflowError(f"stages.{stage_name}.template_file must be a non-empty string if provided.")
         timeout_sec = stage_raw.get("timeout_sec")
         stages[stage_name] = StageConfig(
             name=stage_name,
             agent=agent,
-            template_file=_resolve_path(template_file_raw, base_dir),
+            template_file=template_file,
             timeout_sec=int(timeout_sec) if timeout_sec is not None else None,
         )
 
