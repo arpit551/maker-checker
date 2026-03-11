@@ -1,0 +1,61 @@
+[workflow]
+max_cycles = 3
+artifacts_dir = "runs"
+history_dir = "memory"
+history_limit = 3
+
+[inputs]
+task_prompt_file = "briefs/task.md"
+evaluation_prompt_file = "briefs/evaluation.md"
+
+[agents.codex]
+command = [
+  "codex",
+  "exec",
+  "--skip-git-repo-check",
+  "--dangerously-bypass-approvals-and-sandbox",
+  "--ephemeral",
+  "-c",
+  "model_reasoning_effort=\"low\"",
+  "-o",
+  "{output_file}",
+  "-"
+]
+input_mode = "stdin"
+timeout_sec = 900
+
+[agents.claude]
+command = [
+  "claude",
+  "-p",
+  "--dangerously-skip-permissions",
+  "--no-session-persistence",
+  "--session-id",
+  "{session_id}"
+]
+input_mode = "stdin"
+timeout_sec = 900
+
+[stages.plan]
+agent = "codex"
+template_file = "templates/stages/plan.md"
+
+[stages.critique]
+agent = "claude"
+template_file = "templates/stages/critique.md"
+
+[stages.revise]
+agent = "codex"
+template_file = "templates/stages/revise.md"
+
+[stages.execute]
+agent = "claude"
+template_file = "templates/stages/execute.md"
+
+[stages.verify]
+agent = "codex"
+template_file = "templates/stages/verify.md"
+
+[stages.evaluate]
+agent = "codex"
+template_file = "templates/stages/evaluate.md"
