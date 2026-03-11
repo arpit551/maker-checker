@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import subprocess
 import threading
@@ -43,6 +44,9 @@ from .text import (
     shorten_text,
     summarize_items,
 )
+
+
+RUN_PROCESS_FILE = "run_process.json"
 
 
 def load_history_entries(history_dir: Path) -> list[dict[str, Any]]:
@@ -96,6 +100,91 @@ def append_event(run_dir: Path, message: str) -> None:
     timestamp = datetime.now().isoformat(timespec="seconds")
     with (run_dir / "events.log").open("a", encoding="utf-8") as f:
         f.write(f"[{timestamp}] {message}\n")
+
+
+def write_run_process_file(
+    run_dir: Path,
+    *,
+    state: str,
+    active_cycle: int | None,
+    active_stage: str | None,
+    started_at: str | None,
+    ended_at: str | None = None,
+) -> None:
+    payload = {
+        "pid": os.getpid(),
+        "state": state,
+        "active_cycle": active_cycle,
+        "active_stage": active_stage,
+        "started_at": started_at,
+        "ended_at": ended_at,
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    (run_dir / RUN_PROCESS_FILE).write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def strip_codex_log_noise(text: str, stream_name: str) -> str:
+    if not text:
+        return ""
+
+    lines = text.splitlines()
+    filtered: list[str] = []
+    in_prompt_echo = False
+    saw_codex_banner = False
+
+    for line in lines:
+        content = line
+        prefix = ""
+        if stream_name == "combined":
+            match = re.match(r"^\[(stdout|stderr)\]\s?(.*)$", line)
+            if match:
+                prefix = f"[{match.group(1)}] "
+                content = match.group(2)
+                if match.group(1) != "stderr":
+                    filtered.append(line)
+                    continue
+            else:
+                filtered.append(line)
+                continue
+        elif stream_name != "stderr":
+            filtered.append(line)
+            continue
+
+        normalized = content.strip()
+        if normalized.startswith("OpenAI Codex v"):
+            saw_codex_banner = True
+            continue
+        if saw_codex_banner and normalized in {"--------"}:
+            continue
+        if saw_codex_banner and normalized in {"user"}:
+            in_prompt_echo = True
+            continue
+        if saw_codex_banner and any(
+            normalized.startswith(prefix_text)
+            for prefix_text in (
+                "workdir:",
+                "model:",
+                "provider:",
+                "approval:",
+                "sandbox:",
+                "reasoning effort:",
+                "reasoning summaries:",
+                "session id:",
+            )
+        ):
+            continue
+        if normalized.startswith("mcp startup:"):
+            in_prompt_echo = False
+            continue
+        if "codex_core::shell_snapshot" in normalized:
+            in_prompt_echo = False
+            continue
+        if in_prompt_echo:
+            continue
+        filtered.append(prefix + content if prefix else content)
+
+    sanitized = "\n".join(filtered).strip()
+    return sanitized + ("\n" if sanitized else "")
 
 
 def read_event_tail(run_dir: Path, limit: int = 20) -> list[str]:
@@ -563,6 +652,7 @@ def build_status_payload(
     active_cycle: int | None,
     active_stage: str | None,
 ) -> dict[str, Any]:
+    is_running = state == "running"
     cycles = []
     cycle_lookup = {cycle["cycle"]: cycle for cycle in summary.get("cycles", [])}
     started_cycle_numbers: list[int] = []
@@ -596,12 +686,12 @@ def build_status_payload(
             current_cycle_record
         )
 
-    active_run_cycle = active_cycle
+    active_run_cycle = active_cycle if is_running else None
     if active_run_cycle is None and started_cycle_numbers:
         active_run_cycle = started_cycle_numbers[-1]
 
     next_stage = None
-    if active_stage is not None and active_cycle is not None:
+    if is_running and active_stage is not None and active_cycle is not None:
         next_stage = active_stage
     else:
         for cycle_number in range(1, config.max_cycles + 1):
@@ -635,14 +725,14 @@ def build_status_payload(
         }
     latest_outputs = build_latest_outputs(active_cycle_snapshot or latest_cycle)
     current_session = None
-    if active_cycle_snapshot and active_stage:
+    if is_running and active_cycle_snapshot and active_stage:
         current_session = next(
             (item for item in active_cycle_snapshot["stage_details"] if item["stage"] == active_stage),
             None,
         )
 
     what_happened = read_event_tail(run_dir, limit=6)
-    if active_cycle and active_stage:
+    if is_running and active_cycle and active_stage:
         agent_name = current_session.get("agent") if current_session else None
         what_is_happening = (
             f"Attempt {current_attempt} is running cycle {active_cycle}, stage {active_stage}"
@@ -674,8 +764,8 @@ def build_status_payload(
         "schema_version": STATE_SCHEMA_VERSION,
         "run_id": run_dir.name,
         "state": state,
-        "active_cycle": active_cycle,
-        "active_stage": active_stage,
+        "active_cycle": active_cycle if is_running else None,
+        "active_stage": active_stage if is_running else None,
         "next_stage": next_stage,
         "started_at": summary.get("started_at"),
         "ended_at": summary.get("ended_at"),
@@ -780,11 +870,13 @@ def render_status_markdown(
 
     for cycle in started_cycles:
         record = cycle_lookup.get(cycle)
+        issues = record.get("issues", []) if record else []
+        elapsed_sec = record.get("elapsed_sec") if record else None
         row = [
             str(cycle),
             *(STATUS_TOKENS[progress[cycle][stage]] for stage in REQUIRED_STAGES),
-            str(len(record["issues"])) if record else "-",
-            f"{record['elapsed_sec']:.1f}s" if record else "-",
+            str(len(issues)) if record else "-",
+            f"{elapsed_sec:.1f}s" if isinstance(elapsed_sec, (int, float)) else "-",
         ]
         lines.append("| " + " | ".join(row) + " |")
 
@@ -877,7 +969,12 @@ def render_run_summary_markdown(
     history_entry: dict[str, Any],
 ) -> str:
     cycles = summary.get("cycles", [])
-    total_elapsed = sum(float(cycle.get("elapsed_sec", 0)) for cycle in cycles)
+    total_elapsed = sum(
+        float(elapsed)
+        for cycle in cycles
+        for elapsed in [cycle.get("elapsed_sec")]
+        if isinstance(elapsed, (int, float))
+    )
     token_total = 0
     for cycle in cycles:
         for stage_name in REQUIRED_STAGES:
@@ -916,6 +1013,7 @@ def render_run_summary_markdown(
             ]
         )
         for cycle in cycles:
+            elapsed_sec = cycle.get("elapsed_sec")
             lines.append(
                 "| "
                 + " | ".join(
@@ -926,7 +1024,7 @@ def render_run_summary_markdown(
                         "pass" if cycle["evaluate_pass"] else "fail",
                         str(len(cycle["issues"])),
                         cycle.get("issue_delta", {}).get("summary", "-"),
-                        f"{cycle['elapsed_sec']:.1f}s",
+                        f"{elapsed_sec:.1f}s" if isinstance(elapsed_sec, (int, float)) else "-",
                     ]
                 )
                 + " |"
@@ -1188,10 +1286,20 @@ def run_workflow(config: WorkflowConfig, run_name: str | None = None) -> Path:
     }
     progress = init_progress(config.max_cycles)
     current_plan = ""
+    current_cycle_number: int | None = None
+    current_stage_name: str | None = None
+    finalized = False
     append_event(run_dir, "run created")
     append_event(
         run_dir,
         f"workspace ready in {execution_cwd} from {git_context.base_ref} ({git_context.base_commit})",
+    )
+    write_run_process_file(
+        run_dir,
+        state="running",
+        active_cycle=None,
+        active_stage=None,
+        started_at=summary["started_at"],
     )
 
     write_status_files(
@@ -1202,101 +1310,262 @@ def run_workflow(config: WorkflowConfig, run_name: str | None = None) -> Path:
         state="running",
     )
 
-    for cycle in range(1, config.max_cycles + 1):
-        print(f"[cycle {cycle}] starting")
-        append_event(run_dir, f"cycle {cycle} started")
-        cycle_dir = run_dir / f"cycle-{cycle:02d}"
-        cycle_dir.mkdir(parents=True, exist_ok=True)
-        stage_outputs: dict[str, str] = {}
-        stage_timings: dict[str, float] = {}
-        session_ids: dict[str, str | None] = {}
-        cycle_t0 = time.monotonic()
-        previous_cycle = summary["cycles"][-1] if summary["cycles"] else None
-        retry_reason = build_retry_reason(previous_cycle)
+    try:
+        for cycle in range(1, config.max_cycles + 1):
+            current_cycle_number = cycle
+            print(f"[cycle {cycle}] starting")
+            append_event(run_dir, f"cycle {cycle} started")
+            cycle_dir = run_dir / f"cycle-{cycle:02d}"
+            cycle_dir.mkdir(parents=True, exist_ok=True)
+            stage_outputs: dict[str, str] = {}
+            stage_timings: dict[str, float] = {}
+            session_ids: dict[str, str | None] = {}
+            cycle_t0 = time.monotonic()
+            previous_cycle = summary["cycles"][-1] if summary["cycles"] else None
+            retry_reason = build_retry_reason(previous_cycle)
 
-        try:
-            for step_index, stage_name in enumerate(REQUIRED_STAGES, start=1):
-                stage = config.stages[stage_name]
-                agent = config.agents[stage.agent]
-                stage_dir = cycle_dir / f"{step_index:02d}-{stage_name}"
-                context = build_cycle_context(base_context, stage_outputs, cycle, config.max_cycles)
-                prompt = render_prompt(stage.template_file, context)
-                invocation = prepare_stage_run(stage, agent, prompt, stage_dir)
-                (stage_dir / "cwd.txt").write_text(str(execution_cwd), encoding="utf-8")
-                session_ids[stage_name] = invocation["session_id"]
+            try:
+                for step_index, stage_name in enumerate(REQUIRED_STAGES, start=1):
+                    current_stage_name = stage_name
+                    stage = config.stages[stage_name]
+                    agent = config.agents[stage.agent]
+                    stage_dir = cycle_dir / f"{step_index:02d}-{stage_name}"
+                    context = build_cycle_context(base_context, stage_outputs, cycle, config.max_cycles)
+                    prompt = render_prompt(stage.template_file, context)
+                    invocation = prepare_stage_run(stage, agent, prompt, stage_dir)
+                    (stage_dir / "cwd.txt").write_text(str(execution_cwd), encoding="utf-8")
+                    session_ids[stage_name] = invocation["session_id"]
 
-                progress[cycle][stage_name] = STATUS_RUNNING
-                write_status_files(
+                    progress[cycle][stage_name] = STATUS_RUNNING
+                    write_run_process_file(
+                        run_dir,
+                        state="running",
+                        active_cycle=cycle,
+                        active_stage=stage_name,
+                        started_at=summary["started_at"],
+                    )
+                    write_status_files(
+                        config=config,
+                        run_dir=run_dir,
+                        summary=summary,
+                        progress=progress,
+                        state="running",
+                        active_cycle=cycle,
+                        active_stage=stage_name,
+                    )
+
+                    print(f"[cycle {cycle}] {stage_name} -> {agent.name}")
+                    append_event(run_dir, f"cycle {cycle} stage {stage_name} started via {agent.name}")
+                    output, elapsed = run_stage(
+                        stage,
+                        agent,
+                        prompt,
+                        stage_dir,
+                        invocation=invocation,
+                        cwd=execution_cwd,
+                        extra_env={
+                            "MAKER_CHECKER_RUN_ID": run_dir.name,
+                            "MAKER_CHECKER_PROJECT_DIR": str(project_dir),
+                            "MAKER_CHECKER_WORKSPACE_DIR": str(config.workspace_dir or ""),
+                            "MAKER_CHECKER_EXECUTION_CWD": str(execution_cwd),
+                            "MAKER_CHECKER_GIT_MODE": git_context.mode,
+                            "MAKER_CHECKER_GIT_BRANCH": git_context.branch or "",
+                        },
+                    )
+                    stage_outputs[stage_name] = output
+                    stage_timings[stage_name] = elapsed
+                    progress[cycle][stage_name] = STATUS_COMPLETED
+
+                    print(f"[cycle {cycle}] {stage_name} completed in {elapsed:.1f}s")
+                    append_event(run_dir, f"cycle {cycle} stage {stage_name} completed in {elapsed:.1f}s")
+                    write_status_files(
+                        config=config,
+                        run_dir=run_dir,
+                        summary=summary,
+                        progress=progress,
+                        state="running",
+                        active_cycle=cycle,
+                        active_stage=stage_name,
+                    )
+
+            except WorkflowError as exc:
+                progress[cycle][stage_name] = STATUS_FAILED
+                failed_stage_dir = cycle_dir / f"{step_index:02d}-{stage_name}"
+                if git_context.mode == "worktree" and git_context.current_checkpoint:
+                    rollback_to_checkpoint(
+                        git_context,
+                        git_context.current_checkpoint,
+                        f"stage failure in cycle {cycle} / {stage_name}",
+                        cycle,
+                    )
+                    summary["workspace"] = describe_context(git_context)
+                    append_event(
+                        run_dir,
+                        f"workspace rolled back to {git_context.current_checkpoint} after stage failure",
+                    )
+                summary["failure"] = {
+                    "cycle": cycle,
+                    "attempt": cycle,
+                    "stage": stage_name,
+                    "agent": stage.agent,
+                    "session_id": read_optional_text(failed_stage_dir / "session_id.txt"),
+                    "reported_session_id": read_optional_text(failed_stage_dir / "reported_session_id.txt"),
+                    "error": str(exc),
+                }
+                summary["completed"] = False
+                summary["ended_at"] = datetime.now().isoformat(timespec="seconds")
+                append_event(run_dir, f"cycle {cycle} stage {stage_name} failed: {exc}")
+                finalize_run(
                     config=config,
                     run_dir=run_dir,
                     summary=summary,
+                    task_prompt=task_prompt,
+                    evaluation_prompt=evaluation_prompt,
+                    current_plan=current_plan,
                     progress=progress,
-                    state="running",
+                    state="failed",
                     active_cycle=cycle,
                     active_stage=stage_name,
                 )
+                finalized = True
+                raise
 
-                print(f"[cycle {cycle}] {stage_name} -> {agent.name}")
-                append_event(run_dir, f"cycle {cycle} stage {stage_name} started via {agent.name}")
-                output, elapsed = run_stage(
-                    stage,
-                    agent,
-                    prompt,
-                    stage_dir,
-                    invocation=invocation,
-                    cwd=execution_cwd,
-                    extra_env={
-                        "MAKER_CHECKER_RUN_ID": run_dir.name,
-                        "MAKER_CHECKER_PROJECT_DIR": str(project_dir),
-                        "MAKER_CHECKER_WORKSPACE_DIR": str(config.workspace_dir or ""),
-                        "MAKER_CHECKER_EXECUTION_CWD": str(execution_cwd),
-                        "MAKER_CHECKER_GIT_MODE": git_context.mode,
-                        "MAKER_CHECKER_GIT_BRANCH": git_context.branch or "",
-                    },
-                )
-                stage_outputs[stage_name] = output
-                stage_timings[stage_name] = elapsed
-                progress[cycle][stage_name] = STATUS_COMPLETED
+            plan_output = stage_outputs.get("plan", "")
+            revised_output = stage_outputs.get("revise", "").strip() or plan_output
+            execution_output = stage_outputs.get("execute", "")
+            verification_output = stage_outputs.get("verify", "")
+            evaluation_output = stage_outputs.get("evaluate", "")
 
-                print(f"[cycle {cycle}] {stage_name} completed in {elapsed:.1f}s")
-                append_event(run_dir, f"cycle {cycle} stage {stage_name} completed in {elapsed:.1f}s")
-                write_status_files(
-                    config=config,
-                    run_dir=run_dir,
-                    summary=summary,
-                    progress=progress,
-                    state="running",
-                    active_cycle=cycle,
-                    active_stage=stage_name,
-                )
+            verify_issues, verify_pass = parse_assessment(verification_output)
+            eval_issues, eval_pass = parse_assessment(evaluation_output)
+            unresolved = dedupe_preserve_order(verify_issues + eval_issues)
 
-        except WorkflowError as exc:
-            progress[cycle][stage_name] = STATUS_FAILED
-            failed_stage_dir = cycle_dir / f"{step_index:02d}-{stage_name}"
-            if git_context.mode == "worktree" and git_context.current_checkpoint:
-                rollback_to_checkpoint(
-                    git_context,
-                    git_context.current_checkpoint,
-                    f"stage failure in cycle {cycle} / {stage_name}",
-                    cycle,
-                )
-                summary["workspace"] = describe_context(git_context)
-                append_event(
-                    run_dir,
-                    f"workspace rolled back to {git_context.current_checkpoint} after stage failure",
-                )
-            summary["failure"] = {
+            current_plan = revised_output
+            base_context["previous_plan"] = current_plan
+            base_context["previous_execution_output"] = execution_output
+            base_context["previous_verification_output"] = verification_output
+            base_context["previous_evaluation_output"] = evaluation_output
+            base_context["unresolved_issues_bulleted"] = (
+                "\n".join(f"- {issue}" for issue in unresolved) if unresolved else "- None"
+            )
+            base_context["unresolved_issues_json"] = json.dumps(unresolved, ensure_ascii=True, indent=2)
+
+            cycle_elapsed = round(time.monotonic() - cycle_t0, 3)
+            cycle_record = {
                 "cycle": cycle,
                 "attempt": cycle,
-                "stage": stage_name,
-                "agent": stage.agent,
-                "session_id": read_optional_text(failed_stage_dir / "session_id.txt"),
-                "reported_session_id": read_optional_text(failed_stage_dir / "reported_session_id.txt"),
-                "error": str(exc),
+                "retry_reason": retry_reason,
+                "verify_pass": verify_pass,
+                "evaluate_pass": eval_pass,
+                "issues": unresolved,
+                "issue_delta": build_issue_delta(previous_cycle["issues"], unresolved) if previous_cycle else build_issue_delta([], unresolved),
+                "elapsed_sec": cycle_elapsed,
+                "stage_timings_sec": stage_timings,
+                "session_ids": session_ids,
+            }
+            regression_reason = detect_cycle_regression(previous_cycle, cycle_record)
+            if git_context.mode == "worktree":
+                previous_checkpoint = git_context.current_checkpoint
+                checkpoint_commit = create_checkpoint(git_context, f"cycle-{cycle}")
+                cycle_record["checkpoint_commit"] = checkpoint_commit
+                if regression_reason and previous_checkpoint:
+                    rollback_to_checkpoint(git_context, previous_checkpoint, regression_reason, cycle)
+                    cycle_record["accepted"] = False
+                    cycle_record["regression_reason"] = regression_reason
+                    cycle_record["reverted_to_commit"] = previous_checkpoint
+                    append_event(
+                        run_dir,
+                        f"cycle {cycle} regressed; workspace rolled back to {previous_checkpoint}",
+                    )
+                else:
+                    cycle_record["accepted"] = True
+            else:
+                cycle_record["accepted"] = regression_reason is None
+                if regression_reason:
+                    cycle_record["regression_reason"] = regression_reason
+            summary["cycles"].append(cycle_record)
+            summary["workspace"] = describe_context(git_context)
+
+            (cycle_dir / "issues.json").write_text(
+                json.dumps(
+                    {
+                        "verify_issues": verify_issues,
+                        "evaluate_issues": eval_issues,
+                        "unresolved_issues": unresolved,
+                        "verify_pass": verify_pass,
+                        "evaluate_pass": eval_pass,
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+
+            print(
+                f"[cycle {cycle}] issues={len(unresolved)} verify_pass={verify_pass} evaluate_pass={eval_pass}"
+            )
+            append_event(
+                run_dir,
+                f"cycle {cycle} finished with {len(unresolved)} issue(s), "
+                f"verify_pass={verify_pass}, evaluate_pass={eval_pass}",
+            )
+            current_stage_name = None
+            write_run_process_file(
+                run_dir,
+                state="running",
+                active_cycle=cycle,
+                active_stage=None,
+                started_at=summary["started_at"],
+            )
+            write_status_files(
+                config=config,
+                run_dir=run_dir,
+                summary=summary,
+                progress=progress,
+                state="running",
+            )
+
+            if not unresolved and eval_pass:
+                summary["completed"] = True
+                summary["stopped_at_cycle"] = cycle
+                append_event(run_dir, f"run converged at cycle {cycle}")
+                break
+
+        summary["ended_at"] = datetime.now().isoformat(timespec="seconds")
+        if summary.get("completed"):
+            append_event(run_dir, "run completed successfully")
+        else:
+            append_event(run_dir, "run stopped at max cycles with unresolved issues")
+        finalize_run(
+            config=config,
+            run_dir=run_dir,
+            summary=summary,
+            task_prompt=task_prompt,
+            evaluation_prompt=evaluation_prompt,
+            current_plan=current_plan,
+            progress=progress,
+            state="completed" if summary.get("completed") else "incomplete",
+        )
+        finalized = True
+
+        print(f"Run completed. Artifacts: {run_dir}")
+        if not summary.get("completed"):
+            print("Run stopped at max cycles with unresolved issues.")
+
+        return run_dir
+    except KeyboardInterrupt as exc:
+        if not finalized:
+            if current_cycle_number and current_stage_name:
+                progress[current_cycle_number][current_stage_name] = STATUS_FAILED
+            summary["failure"] = {
+                "cycle": current_cycle_number,
+                "attempt": current_cycle_number,
+                "stage": current_stage_name,
+                "agent": config.stages[current_stage_name].agent if current_stage_name else None,
+                "error": "Run interrupted by user.",
             }
             summary["completed"] = False
             summary["ended_at"] = datetime.now().isoformat(timespec="seconds")
-            append_event(run_dir, f"cycle {cycle} stage {stage_name} failed: {exc}")
+            append_event(run_dir, "run interrupted by user")
             finalize_run(
                 config=config,
                 run_dir=run_dir,
@@ -1306,121 +1575,18 @@ def run_workflow(config: WorkflowConfig, run_name: str | None = None) -> Path:
                 current_plan=current_plan,
                 progress=progress,
                 state="failed",
-                active_cycle=cycle,
-                active_stage=stage_name,
+                active_cycle=current_cycle_number,
+                active_stage=current_stage_name,
             )
-            raise
-
-        plan_output = stage_outputs.get("plan", "")
-        revised_output = stage_outputs.get("revise", "").strip() or plan_output
-        execution_output = stage_outputs.get("execute", "")
-        verification_output = stage_outputs.get("verify", "")
-        evaluation_output = stage_outputs.get("evaluate", "")
-
-        verify_issues, verify_pass = parse_assessment(verification_output)
-        eval_issues, eval_pass = parse_assessment(evaluation_output)
-        unresolved = dedupe_preserve_order(verify_issues + eval_issues)
-
-        current_plan = revised_output
-        base_context["previous_plan"] = current_plan
-        base_context["previous_execution_output"] = execution_output
-        base_context["previous_verification_output"] = verification_output
-        base_context["previous_evaluation_output"] = evaluation_output
-        base_context["unresolved_issues_bulleted"] = (
-            "\n".join(f"- {issue}" for issue in unresolved) if unresolved else "- None"
-        )
-        base_context["unresolved_issues_json"] = json.dumps(unresolved, ensure_ascii=True, indent=2)
-
-        cycle_elapsed = round(time.monotonic() - cycle_t0, 3)
-        cycle_record = {
-            "cycle": cycle,
-            "attempt": cycle,
-            "retry_reason": retry_reason,
-            "verify_pass": verify_pass,
-            "evaluate_pass": eval_pass,
-            "issues": unresolved,
-            "issue_delta": build_issue_delta(previous_cycle["issues"], unresolved) if previous_cycle else build_issue_delta([], unresolved),
-            "elapsed_sec": cycle_elapsed,
-            "stage_timings_sec": stage_timings,
-            "session_ids": session_ids,
-        }
-        regression_reason = detect_cycle_regression(previous_cycle, cycle_record)
-        if git_context.mode == "worktree":
-            previous_checkpoint = git_context.current_checkpoint
-            checkpoint_commit = create_checkpoint(git_context, f"cycle-{cycle}")
-            cycle_record["checkpoint_commit"] = checkpoint_commit
-            if regression_reason and previous_checkpoint:
-                rollback_to_checkpoint(git_context, previous_checkpoint, regression_reason, cycle)
-                cycle_record["accepted"] = False
-                cycle_record["regression_reason"] = regression_reason
-                cycle_record["reverted_to_commit"] = previous_checkpoint
-                append_event(
-                    run_dir,
-                    f"cycle {cycle} regressed; workspace rolled back to {previous_checkpoint}",
-                )
-            else:
-                cycle_record["accepted"] = True
-        else:
-            cycle_record["accepted"] = regression_reason is None
-            if regression_reason:
-                cycle_record["regression_reason"] = regression_reason
-        summary["cycles"].append(cycle_record)
-        summary["workspace"] = describe_context(git_context)
-
-        (cycle_dir / "issues.json").write_text(
-            json.dumps(
-                {
-                    "verify_issues": verify_issues,
-                    "evaluate_issues": eval_issues,
-                    "unresolved_issues": unresolved,
-                    "verify_pass": verify_pass,
-                    "evaluate_pass": eval_pass,
-                },
-                indent=2,
-            ),
-            encoding="utf-8",
-        )
-
-        print(
-            f"[cycle {cycle}] issues={len(unresolved)} verify_pass={verify_pass} evaluate_pass={eval_pass}"
-        )
-        append_event(
+            finalized = True
+        raise
+    finally:
+        final_state = "completed" if summary.get("completed") else "failed" if summary.get("failure") else "incomplete"
+        write_run_process_file(
             run_dir,
-            f"cycle {cycle} finished with {len(unresolved)} issue(s), "
-            f"verify_pass={verify_pass}, evaluate_pass={eval_pass}",
+            state=final_state,
+            active_cycle=current_cycle_number,
+            active_stage=current_stage_name,
+            started_at=summary.get("started_at"),
+            ended_at=summary.get("ended_at"),
         )
-        write_status_files(
-            config=config,
-            run_dir=run_dir,
-            summary=summary,
-            progress=progress,
-            state="running",
-        )
-
-        if not unresolved and eval_pass:
-            summary["completed"] = True
-            summary["stopped_at_cycle"] = cycle
-            append_event(run_dir, f"run converged at cycle {cycle}")
-            break
-
-    summary["ended_at"] = datetime.now().isoformat(timespec="seconds")
-    if summary.get("completed"):
-        append_event(run_dir, "run completed successfully")
-    else:
-        append_event(run_dir, "run stopped at max cycles with unresolved issues")
-    finalize_run(
-        config=config,
-        run_dir=run_dir,
-        summary=summary,
-        task_prompt=task_prompt,
-        evaluation_prompt=evaluation_prompt,
-        current_plan=current_plan,
-        progress=progress,
-        state="completed" if summary.get("completed") else "incomplete",
-    )
-
-    print(f"Run completed. Artifacts: {run_dir}")
-    if not summary.get("completed"):
-        print("Run stopped at max cycles with unresolved issues.")
-
-    return run_dir

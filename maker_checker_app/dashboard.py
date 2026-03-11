@@ -4,14 +4,24 @@ import argparse
 from datetime import datetime
 import json
 import mimetypes
+import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+import subprocess
 from threading import Thread
 from urllib.parse import parse_qs, unquote, urlparse
 
 from .config import get_history_dir, load_config
 from .models import DEFAULT_CONFIG_FILE, REQUIRED_STAGES, STATE_SCHEMA_VERSION, WorkflowConfig
-from .runtime import build_status_payload, init_progress, load_history_entries
+from .runtime import (
+    RUN_PROCESS_FILE,
+    build_status_payload,
+    init_progress,
+    load_history_entries,
+    render_run_summary_markdown,
+    strip_codex_log_noise,
+    write_status_files,
+)
 
 
 STATIC_DIR = Path(__file__).resolve().parent / "dashboard_static"
@@ -119,6 +129,163 @@ def _load_status_seed(run_dir: Path) -> dict:
     return {}
 
 
+def _read_process_state(run_dir: Path) -> dict:
+    path = run_dir / RUN_PROCESS_FILE
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+
+
+def _pid_is_alive(pid: int | None) -> bool:
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def _list_process_commands() -> list[str]:
+    proc = subprocess.run(
+        ["ps", "-Ao", "command="],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        return []
+    return [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+
+
+def _has_legacy_stage_process(run_dir: Path, seed: dict) -> bool:
+    active_cycle = seed.get("active_cycle")
+    active_stage = seed.get("active_stage")
+    if not active_cycle or not active_stage or active_stage not in REQUIRED_STAGES:
+        return False
+
+    stage_dir = get_stage_dir(run_dir, int(active_cycle), str(active_stage))
+    assistant_output_path = str(stage_dir / "assistant_output.txt")
+    cwd = read_text(stage_dir / "cwd.txt").strip()
+    session_id = read_text(stage_dir / "session_id.txt").strip()
+    tokens = [assistant_output_path, cwd, session_id]
+    commands = _list_process_commands()
+    return any(token and token in command for token in tokens for command in commands)
+
+
+def _build_progress_from_seed(config: WorkflowConfig, seed: dict) -> dict[int, dict[str, str]]:
+    progress = init_progress(int(seed.get("max_cycles", config.max_cycles)))
+    for cycle_record in seed.get("cycles", []):
+        cycle_number = int(cycle_record.get("cycle", 0))
+        if cycle_number not in progress:
+            continue
+        for stage_name, state in (cycle_record.get("stages") or {}).items():
+            if stage_name in progress[cycle_number]:
+                progress[cycle_number][stage_name] = state
+    active_cycle = seed.get("active_cycle")
+    active_stage = seed.get("active_stage")
+    if (
+        seed.get("state") == "running"
+        and isinstance(active_cycle, int)
+        and active_cycle in progress
+        and active_stage in progress[active_cycle]
+    ):
+        progress[active_cycle][active_stage] = "running"
+    return progress
+
+
+def _repair_orphaned_run(config: WorkflowConfig, run_dir: Path, seed: dict, reason: str) -> dict:
+    progress = _build_progress_from_seed(config, seed)
+    active_cycle = seed.get("active_cycle")
+    active_stage = seed.get("active_stage")
+    if (
+        isinstance(active_cycle, int)
+        and active_cycle in progress
+        and active_stage in progress[active_cycle]
+    ):
+        progress[active_cycle][active_stage] = "failed"
+
+    summary = {
+        "started_at": seed.get("started_at"),
+        "ended_at": datetime.now().isoformat(timespec="seconds"),
+        "cycles": seed.get("cycles", []),
+        "completed": False,
+        "failure": {
+            "cycle": active_cycle,
+            "attempt": active_cycle,
+            "stage": active_stage,
+            "agent": (seed.get("current_session") or {}).get("agent"),
+            "session_id": (seed.get("current_session") or {}).get("session_id"),
+            "reported_session_id": (seed.get("current_session") or {}).get("reported_session_id"),
+            "error": reason,
+        },
+        "history_loaded": seed.get("history_loaded", False),
+        "workspace": seed.get("workspace"),
+    }
+    append_event_message = f"dashboard repaired orphaned run: {reason}"
+    from .runtime import append_event  # local import to avoid widening top-level dependency cycles
+
+    append_event(run_dir, append_event_message)
+    write_status_files(
+        config=config,
+        run_dir=run_dir,
+        summary=summary,
+        progress=progress,
+        state="failed",
+        active_cycle=active_cycle,
+        active_stage=active_stage,
+    )
+
+    task_prompt = read_text(run_dir / "task_brief.md") or read_text(config.task_prompt_file)
+    evaluation_prompt = read_text(run_dir / "evaluation_brief.md") or read_text(config.evaluation_prompt_file)
+    history_entry = {
+        "outcome": "failed",
+        "improvements": [],
+        "failures": [reason],
+        "next_run_notes": ["Re-run after verifying the interruption cause and active stage outputs."],
+    }
+    markdown = render_run_summary_markdown(
+        config=config,
+        run_dir=run_dir,
+        summary=summary,
+        task_prompt=task_prompt or "Task brief unavailable.",
+        evaluation_prompt=evaluation_prompt or "Evaluation brief unavailable.",
+        history_entry=history_entry,
+    )
+    (run_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    (run_dir / "run_summary.md").write_text(markdown, encoding="utf-8")
+    return _load_status_seed(run_dir)
+
+
+def _repair_if_orphaned(config: WorkflowConfig, run_dir: Path, seed: dict) -> dict:
+    if seed.get("state") != "running":
+        return seed
+
+    process_state = _read_process_state(run_dir)
+    if process_state:
+        if _pid_is_alive(process_state.get("pid")):
+            return seed
+        reason = (
+            "Run process exited before the active stage completed."
+            if process_state.get("active_stage")
+            else "Run process exited before the workflow finished."
+        )
+        return _repair_orphaned_run(config, run_dir, seed, reason)
+
+    if _has_legacy_stage_process(run_dir, seed):
+        return seed
+
+    return _repair_orphaned_run(
+        config,
+        run_dir,
+        seed,
+        "Run was left in a running state but no workflow or active stage process is still alive.",
+    )
+
+
 def _resolve_default_run_id(config: WorkflowConfig) -> str | None:
     if not config.artifacts_dir.exists():
         return None
@@ -128,7 +295,7 @@ def _resolve_default_run_id(config: WorkflowConfig) -> str | None:
         if not path.is_dir():
             continue
         fallback = fallback or path.name
-        seed = _load_status_seed(path)
+        seed = _repair_if_orphaned(config, path, _load_status_seed(path))
         if seed.get("state") == "running":
             return path.name
     return fallback
@@ -139,14 +306,7 @@ def _rebuild_live_run_detail(config: WorkflowConfig, run_dir: Path, seed: dict) 
         return build_idle_run_detail(config)
 
     max_cycles = int(seed.get("max_cycles", config.max_cycles))
-    progress = init_progress(max_cycles)
-    for cycle_record in seed.get("cycles", []):
-        cycle_number = int(cycle_record.get("cycle", 0))
-        if cycle_number not in progress:
-            continue
-        for stage_name, state in (cycle_record.get("stages") or {}).items():
-            if stage_name in progress[cycle_number]:
-                progress[cycle_number][stage_name] = state
+    progress = _build_progress_from_seed(config, seed)
 
     summary = {
         "started_at": seed.get("started_at"),
@@ -180,6 +340,7 @@ def load_run_detail(config: WorkflowConfig, run_id: str | None) -> dict:
     seed = _load_status_seed(run_dir)
     if not seed:
         return build_idle_run_detail(config)
+    seed = _repair_if_orphaned(config, run_dir, seed)
 
     detail = _rebuild_live_run_detail(config, run_dir, seed)
     summary_path = run_dir / "run_summary.md"
@@ -296,10 +457,11 @@ def load_stage_logs(
     }
     streams: dict[str, dict[str, object]] = {}
     for stream_name, path in stream_files.items():
+        text = read_stage_log_file(path, limit=limit)
         streams[stream_name] = {
             "path": str(path),
             "exists": path.exists(),
-            "text": read_stage_log_file(path, limit=limit),
+            "text": strip_codex_log_noise(text, stream_name),
             "bytes": path.stat().st_size if path.exists() else 0,
         }
 
@@ -329,9 +491,9 @@ def load_stage_detail(
     prompt_path = next(iter(sorted(stage_dir.glob("prompt*"))), None)
     assistant_output = read_text(stage_dir / "assistant_output.txt")
     stdout_text = read_text(stage_dir / "stdout.txt")
-    stderr_text = read_text(stage_dir / "stderr.txt")
+    stderr_text = strip_codex_log_noise(read_text(stage_dir / "stderr.txt"), "stderr")
     prompt_text = read_text(prompt_path) if prompt_path is not None else ""
-    combined_text = read_text(stage_dir / "combined.log")
+    combined_text = strip_codex_log_noise(read_text(stage_dir / "combined.log"), "combined")
     primary_output = assistant_output or stdout_text or stderr_text
 
     return {

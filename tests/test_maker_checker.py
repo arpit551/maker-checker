@@ -1167,6 +1167,13 @@ class TestDashboardHelpers:
             active_cycle=1,
             active_stage="plan",
         )
+        (run_dir / "run_process.json").write_text(json.dumps({
+            "pid": os.getpid(),
+            "state": "running",
+            "active_cycle": 1,
+            "active_stage": "plan",
+            "started_at": summary["started_at"],
+        }))
         (run_dir / "events.log").write_text(
             "[2026-03-12T00:28:09] cycle 1 started\n"
             "[2026-03-12T00:28:10] cycle 1 stage plan started via codex\n"
@@ -1177,6 +1184,157 @@ class TestDashboardHelpers:
         assert detail["active_stage"] == "plan"
         assert detail["last_event"] == "[2026-03-12T00:28:10] cycle 1 stage plan started via codex"
         assert detail["runtime_totals"]["seconds_running"] > 0
+
+    def test_load_run_detail_repairs_orphaned_running_run(self, tmp_workspace: Path):
+        cfg = mc.WorkflowConfig(
+            max_cycles=1,
+            artifacts_dir=tmp_workspace / "runs",
+            task_prompt_file=tmp_workspace / "inputs" / "task_prompt.txt",
+            evaluation_prompt_file=tmp_workspace / "inputs" / "evaluation_prompt.txt",
+            agents={"codex": mc.AgentConfig(
+                name="codex",
+                command=["echo", "hi"],
+                input_mode="stdin",
+                timeout_sec=10,
+            )},
+            stages={
+                name: mc.StageConfig(
+                    name=name,
+                    agent="codex",
+                    template_file=tmp_workspace / "prompts" / "stages" / f"{name}.txt",
+                )
+                for name in mc.REQUIRED_STAGES
+            },
+        )
+
+        run_dir = tmp_workspace / "runs" / "20260312-stale"
+        stage_dir = run_dir / "cycle-01" / "01-plan"
+        stage_dir.mkdir(parents=True)
+        (stage_dir / "stderr.txt").write_text("")
+        (stage_dir / "combined.log").write_text("")
+
+        summary = {
+            "started_at": "2020-01-01T00:00:00",
+            "cycles": [{
+                "cycle": 1,
+                "attempt": 1,
+                "stages": {"plan": mc.STATUS_RUNNING},
+                "issues": [],
+                "elapsed_sec": None,
+            }],
+            "completed": False,
+            "failure": None,
+            "history_loaded": False,
+            "workspace": {
+                "mode": "worktree",
+                "cwd": str(tmp_workspace / ".maker-checker" / "worktrees" / "20260312-stale"),
+            },
+        }
+        progress = mc.init_progress(1)
+        progress[1]["plan"] = mc.STATUS_RUNNING
+        mc.write_status_files(
+            config=cfg,
+            run_dir=run_dir,
+            summary=summary,
+            progress=progress,
+            state="running",
+            active_cycle=1,
+            active_stage="plan",
+        )
+        (run_dir / "events.log").write_text("[2026-03-12T00:28:09] cycle 1 stage plan started via codex\n")
+
+        detail = dash.load_run_detail(cfg, run_dir.name)
+
+        assert detail["state"] == "failed"
+        assert detail["active_stage"] is None
+        assert detail["what_is_happening"] == "Latest completed cycle is 1 with 0 unresolved issue(s)."
+        assert detail["last_error"]["error"] == "Run was left in a running state but no workflow or active stage process is still alive."
+        assert "dashboard repaired orphaned run" in (run_dir / "events.log").read_text(encoding="utf-8")
+        assert json.loads((run_dir / "status.json").read_text(encoding="utf-8"))["state"] == "failed"
+
+    def test_load_stage_logs_filters_codex_banner_noise(self, tmp_workspace: Path):
+        cfg = mc.WorkflowConfig(
+            max_cycles=1,
+            artifacts_dir=tmp_workspace / "runs",
+            task_prompt_file=tmp_workspace / "inputs" / "task_prompt.txt",
+            evaluation_prompt_file=tmp_workspace / "inputs" / "evaluation_prompt.txt",
+            agents={"codex": mc.AgentConfig(
+                name="codex",
+                command=["echo", "hi"],
+                input_mode="stdin",
+                timeout_sec=10,
+            )},
+            stages={
+                name: mc.StageConfig(
+                    name=name,
+                    agent="codex",
+                    template_file=tmp_workspace / "prompts" / "stages" / f"{name}.txt",
+                )
+                for name in mc.REQUIRED_STAGES
+            },
+        )
+
+        run_dir = tmp_workspace / "runs" / "20260312-logs"
+        stage_dir = run_dir / "cycle-01" / "01-plan"
+        stage_dir.mkdir(parents=True)
+        summary = {
+            "started_at": "2020-01-01T00:00:00",
+            "cycles": [{
+                "cycle": 1,
+                "attempt": 1,
+                "stages": {"plan": mc.STATUS_COMPLETED},
+                "issues": [],
+                "elapsed_sec": 1.2,
+            }],
+            "completed": False,
+            "failure": None,
+            "history_loaded": False,
+            "workspace": None,
+        }
+        progress = mc.init_progress(1)
+        progress[1]["plan"] = mc.STATUS_COMPLETED
+        mc.write_status_files(
+            config=cfg,
+            run_dir=run_dir,
+            summary=summary,
+            progress=progress,
+            state="incomplete",
+            active_cycle=None,
+            active_stage=None,
+        )
+        (stage_dir / "stderr.txt").write_text(
+            "OpenAI Codex v0.114.0 (research preview)\n"
+            "--------\n"
+            "workdir: /tmp/work\n"
+            "model: gpt-5.4\n"
+            "user\n"
+            "STAGE: plan\n"
+            "Prompt body\n"
+            "mcp startup: no servers\n"
+            "real stderr line\n"
+            "2026-03-11T00:00:00Z  WARN codex_core::shell_snapshot: noisy cleanup\n"
+        )
+        (stage_dir / "combined.log").write_text(
+            "[stderr] OpenAI Codex v0.114.0 (research preview)\n"
+            "[stderr] --------\n"
+            "[stderr] workdir: /tmp/work\n"
+            "[stderr] user\n"
+            "[stderr] STAGE: plan\n"
+            "[stderr] Prompt body\n"
+            "[stderr] mcp startup: no servers\n"
+            "[stderr] real stderr line\n"
+            "[stdout] useful stdout line\n"
+        )
+
+        logs = dash.load_stage_logs(cfg, run_dir.name, 1, "plan")
+        detail = dash.load_stage_detail(cfg, run_dir.name, 1, "plan")
+
+        assert "OpenAI Codex" not in logs["streams"]["stderr"]["text"]
+        assert "Prompt body" not in logs["streams"]["stderr"]["text"]
+        assert "real stderr line" in logs["streams"]["stderr"]["text"]
+        assert "[stdout] useful stdout line" in logs["streams"]["combined"]["text"]
+        assert "Prompt body" not in logs["streams"]["combined"]["text"]
+        assert detail["content"]["stderr"].strip() == "real stderr line"
 
     def test_pending_stage_detail_returns_empty_payload(self, tmp_workspace: Path):
         cfg = mc.WorkflowConfig(
