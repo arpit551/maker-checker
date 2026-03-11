@@ -24,6 +24,7 @@ You are penalized for invented repo facts, stale assumptions, vague plans, or re
 - Prefer primary sources and official docs; for research-heavy work, prefer recent papers over blog summaries.
 - Keep only the information that changes the plan. Do not restate the entire brief.
 - Do not inspect or modify repository state while planning.
+- During planning make sure plan is very rich icludes code snippets mostly
 
 ## Output Requirements
 - Return Markdown only.
