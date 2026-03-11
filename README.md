@@ -13,7 +13,13 @@ The default user workflow is centered on a hidden project-local workspace at `.m
 
 ## Install
 
-One-line install from GitHub:
+Source install:
+
+```bash
+pip install .
+```
+
+After publishing the repo to GitHub, one-line install works like this:
 
 ```bash
 uv tool install git+https://github.com/arpit551/maker-checker.git
@@ -23,12 +29,6 @@ Alternative with `pipx`:
 
 ```bash
 pipx install git+https://github.com/arpit551/maker-checker.git
-```
-
-Source install still works:
-
-```bash
-pip install .
 ```
 
 ## Commands
