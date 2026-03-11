@@ -11,7 +11,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 from .config import get_history_dir, load_config
 from .models import DEFAULT_CONFIG_FILE, REQUIRED_STAGES, STATE_SCHEMA_VERSION, WorkflowConfig
-from .runtime import load_history_entries
+from .runtime import build_status_payload, init_progress, load_history_entries
 
 
 STATIC_DIR = Path(__file__).resolve().parent / "dashboard_static"
@@ -88,14 +88,7 @@ def list_runs(config: WorkflowConfig) -> list[dict[str, object]]:
     for path in sorted(config.artifacts_dir.iterdir(), reverse=True):
         if not path.is_dir():
             continue
-        status_path = path / "status.json"
-        summary_path = path / "summary.json"
-        status = {}
-        if status_path.exists():
-            status = json.loads(status_path.read_text(encoding="utf-8"))
-        elif summary_path.exists():
-            status = json.loads(summary_path.read_text(encoding="utf-8"))
-
+        status = load_run_detail(config, path.name)
         evaluation = status.get("evaluation_state", {})
         runtime_totals = status.get("runtime_totals", {})
         runs.append(
@@ -116,24 +109,81 @@ def list_runs(config: WorkflowConfig) -> list[dict[str, object]]:
     return runs
 
 
-def load_run_detail(config: WorkflowConfig, run_id: str | None) -> dict:
-    if run_id:
-        run_dir = config.artifacts_dir / run_id
-        path = run_dir / "status.json"
-    else:
-        path = config.artifacts_dir / "latest_status.json"
-        run_dir = None
-    if not path.exists():
+def _load_status_seed(run_dir: Path) -> dict:
+    status_path = run_dir / "status.json"
+    summary_path = run_dir / "summary.json"
+    if status_path.exists():
+        return json.loads(status_path.read_text(encoding="utf-8"))
+    if summary_path.exists():
+        return json.loads(summary_path.read_text(encoding="utf-8"))
+    return {}
+
+
+def _resolve_default_run_id(config: WorkflowConfig) -> str | None:
+    if not config.artifacts_dir.exists():
+        return None
+
+    fallback: str | None = None
+    for path in sorted(config.artifacts_dir.iterdir(), reverse=True):
+        if not path.is_dir():
+            continue
+        fallback = fallback or path.name
+        seed = _load_status_seed(path)
+        if seed.get("state") == "running":
+            return path.name
+    return fallback
+
+
+def _rebuild_live_run_detail(config: WorkflowConfig, run_dir: Path, seed: dict) -> dict:
+    if not seed:
         return build_idle_run_detail(config)
 
-    detail = json.loads(path.read_text(encoding="utf-8"))
-    if run_dir is None and detail.get("run_id"):
-        run_dir = config.artifacts_dir / detail["run_id"]
-    if run_dir is not None:
-        summary_path = run_dir / "run_summary.md"
-        detail["summary_markdown"] = read_text(summary_path) or "No summary yet."
-    else:
-        detail["summary_markdown"] = "No summary yet."
+    max_cycles = int(seed.get("max_cycles", config.max_cycles))
+    progress = init_progress(max_cycles)
+    for cycle_record in seed.get("cycles", []):
+        cycle_number = int(cycle_record.get("cycle", 0))
+        if cycle_number not in progress:
+            continue
+        for stage_name, state in (cycle_record.get("stages") or {}).items():
+            if stage_name in progress[cycle_number]:
+                progress[cycle_number][stage_name] = state
+
+    summary = {
+        "started_at": seed.get("started_at"),
+        "ended_at": seed.get("ended_at"),
+        "cycles": seed.get("cycles", []),
+        "completed": seed.get("state") == "completed",
+        "failure": seed.get("failure"),
+        "history_loaded": seed.get("history_loaded", False),
+        "workspace": seed.get("workspace"),
+    }
+    detail = build_status_payload(
+        config=config,
+        run_dir=run_dir,
+        summary=summary,
+        progress=progress,
+        state=seed.get("state", "idle"),
+        active_cycle=seed.get("active_cycle"),
+        active_stage=seed.get("active_stage"),
+    )
+    detail["updated_at"] = datetime.now().isoformat(timespec="seconds")
+    return detail
+
+
+def load_run_detail(config: WorkflowConfig, run_id: str | None) -> dict:
+    if run_id is None:
+        run_id = _resolve_default_run_id(config)
+    run_dir = config.artifacts_dir / run_id if run_id else None
+    if run_dir is None or not run_dir.exists():
+        return build_idle_run_detail(config)
+
+    seed = _load_status_seed(run_dir)
+    if not seed:
+        return build_idle_run_detail(config)
+
+    detail = _rebuild_live_run_detail(config, run_dir, seed)
+    summary_path = run_dir / "run_summary.md"
+    detail["summary_markdown"] = read_text(summary_path) or "No summary yet."
     return detail
 
 
@@ -175,9 +225,9 @@ def load_runtime_state(config: WorkflowConfig) -> dict:
 
 
 def build_state_payload(config: WorkflowConfig) -> dict:
-    runtime_state = load_runtime_state(config)
     runs = list_runs(config)
-    current_run_id = runtime_state.get("current_run_id") or select_current_run_id(runs)
+    runtime_state = load_runtime_state(config)
+    current_run_id = select_current_run_id(runs) or runtime_state.get("current_run_id")
     current_run = load_run_detail(config, current_run_id)
     return {
         "schema_version": STATE_SCHEMA_VERSION,
