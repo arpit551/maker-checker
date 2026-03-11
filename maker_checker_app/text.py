@@ -87,6 +87,87 @@ def parse_assessment(value: str) -> tuple[list[str], bool]:
     return dedupe_preserve_order(issues), passed
 
 
+def extract_token_totals(value: str) -> dict[str, int] | None:
+    parsed = extract_first_json(value)
+    if parsed is None:
+        return None
+    return _find_token_totals(parsed)
+
+
+def extract_reported_session_id(value: str) -> str | None:
+    json_match = re.search(
+        r'"(?:session_id|sessionId|thread_id|threadId)"\s*:\s*"([^"]+)"',
+        value,
+        flags=re.IGNORECASE,
+    )
+    if json_match:
+        return json_match.group(1).strip()
+
+    text_match = re.search(
+        r"\b(?:session|thread)\s*(?:id)?\s*[:=]\s*([A-Za-z0-9._:-]{6,})",
+        value,
+        flags=re.IGNORECASE,
+    )
+    if text_match:
+        return text_match.group(1).strip()
+
+    return None
+
+
+def _find_token_totals(value: Any) -> dict[str, int] | None:
+    if isinstance(value, dict):
+        normalized = _normalize_token_dict(value)
+        if normalized is not None:
+            return normalized
+        for child in value.values():
+            nested = _find_token_totals(child)
+            if nested is not None:
+                return nested
+    elif isinstance(value, list):
+        for child in value:
+            nested = _find_token_totals(child)
+            if nested is not None:
+                return nested
+    return None
+
+
+def _normalize_token_dict(value: dict[str, Any]) -> dict[str, int] | None:
+    aliases = {
+        "input_tokens": ("input_tokens", "inputTokens", "prompt_tokens", "promptTokens", "input"),
+        "output_tokens": (
+            "output_tokens",
+            "outputTokens",
+            "completion_tokens",
+            "completionTokens",
+            "output",
+        ),
+        "total_tokens": ("total_tokens", "totalTokens", "total"),
+    }
+
+    resolved: dict[str, int] = {}
+    found_any = False
+    for canonical, keys in aliases.items():
+        for key in keys:
+            raw = value.get(key)
+            if isinstance(raw, bool):
+                continue
+            if isinstance(raw, (int, float)):
+                resolved[canonical] = int(raw)
+                found_any = True
+                break
+
+    if not found_any:
+        return None
+
+    resolved.setdefault("input_tokens", 0)
+    resolved.setdefault("output_tokens", 0)
+    resolved.setdefault(
+        "total_tokens",
+        resolved["input_tokens"] + resolved["output_tokens"],
+    )
+    return resolved
+
+
 def shorten_text(value: str, limit: int = 180) -> str:
     without_markers = re.sub(r"(?m)^\s*[-#*]+\s*", "", value)
     normalized = " ".join(without_markers.split())

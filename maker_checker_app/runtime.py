@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import shlex
 import subprocess
+import threading
 import time
 import uuid
 from datetime import datetime
@@ -12,6 +13,7 @@ from typing import Any
 from .config import get_history_dir
 from .models import (
     REQUIRED_STAGES,
+    STATE_SCHEMA_VERSION,
     STATUS_COMPLETED,
     STATUS_FAILED,
     STATUS_PENDING,
@@ -25,6 +27,8 @@ from .models import (
 from .text import (
     build_cycle_context,
     dedupe_preserve_order,
+    extract_reported_session_id,
+    extract_token_totals,
     parse_assessment,
     read_text_file,
     render_issue_bar,
@@ -95,6 +99,180 @@ def read_stage_output_excerpt(stage_dir: Path, limit: int = 320) -> str:
     return ""
 
 
+def append_stage_stream(stage_dir: Path, stream_name: str, text: str) -> None:
+    if not text:
+        return
+    path = stage_dir / f"{stream_name}.txt"
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(text)
+        handle.flush()
+
+
+def append_combined_stage_log(stage_dir: Path, stream_name: str, text: str) -> None:
+    if not text:
+        return
+    with (stage_dir / "combined.log").open("a", encoding="utf-8") as handle:
+        for line in text.splitlines(keepends=True):
+            handle.write(f"[{stream_name}] {line}")
+        if text and not text.endswith("\n"):
+            handle.write("\n")
+        handle.flush()
+
+
+def stream_pipe_to_files(
+    stage_dir: Path,
+    pipe: Any,
+    stream_name: str,
+    sink: list[str],
+) -> None:
+    combined_buffer = ""
+    try:
+        for chunk in iter(lambda: pipe.read(1), ""):
+            if not chunk:
+                break
+            sink.append(chunk)
+            append_stage_stream(stage_dir, stream_name, chunk)
+            combined_buffer += chunk
+            while "\n" in combined_buffer:
+                line, combined_buffer = combined_buffer.split("\n", 1)
+                append_combined_stage_log(stage_dir, stream_name, line + "\n")
+    finally:
+        if combined_buffer:
+            append_combined_stage_log(stage_dir, stream_name, combined_buffer)
+        if pipe is not None:
+            pipe.close()
+
+
+def read_optional_text(path: Path) -> str | None:
+    if not path.exists():
+        return None
+    text = path.read_text(encoding="utf-8").strip()
+    return text or None
+
+
+def read_optional_json(path: Path) -> Any | None:
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return None
+
+
+def parse_iso_timestamp(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def build_issue_delta(previous_issues: list[str], current_issues: list[str]) -> dict[str, Any]:
+    resolved = [item for item in previous_issues if item not in current_issues]
+    introduced = [item for item in current_issues if item not in previous_issues]
+    persistent = [item for item in current_issues if item in previous_issues]
+
+    summary_parts: list[str] = []
+    if resolved:
+        summary_parts.append(f"resolved {len(resolved)}")
+    if introduced:
+        summary_parts.append(f"introduced {len(introduced)}")
+    if persistent:
+        summary_parts.append(f"carried {len(persistent)}")
+    summary = ", ".join(summary_parts) if summary_parts else "no issue delta"
+
+    return {
+        "resolved": resolved,
+        "introduced": introduced,
+        "persistent": persistent,
+        "resolved_count": len(resolved),
+        "introduced_count": len(introduced),
+        "persistent_count": len(persistent),
+        "summary": summary,
+    }
+
+
+def build_retry_reason(previous_cycle: dict[str, Any] | None) -> str | None:
+    if not previous_cycle:
+        return None
+
+    parts: list[str] = []
+    cycle_number = previous_cycle.get("cycle")
+    issues = previous_cycle.get("issues", [])
+    if issues:
+        parts.append(
+            f"cycle {cycle_number} left {len(issues)} unresolved issue(s)"
+        )
+    if previous_cycle.get("verify_pass") is False:
+        parts.append("verify failed")
+    if previous_cycle.get("evaluate_pass") is False:
+        parts.append("evaluate failed")
+    if not parts:
+        return f"continuation after cycle {cycle_number}"
+    return "; ".join(parts)
+
+
+def find_prompt_path(stage_dir: Path) -> str | None:
+    matches = sorted(stage_dir.glob("prompt*"))
+    if not matches:
+        return None
+    return str(matches[0])
+
+
+def accumulate_runtime_totals(cycles: list[dict[str, Any]]) -> dict[str, Any]:
+    seconds_running = 0.0
+    input_tokens = 0
+    output_tokens = 0
+    total_tokens = 0
+    reported_stage_count = 0
+
+    for cycle in cycles:
+        for stage in cycle.get("stage_details", []):
+            elapsed = stage.get("elapsed_sec")
+            if isinstance(elapsed, (int, float)):
+                seconds_running += float(elapsed)
+
+            tokens = stage.get("tokens") or {}
+            if any(tokens.get(key, 0) for key in ("input_tokens", "output_tokens", "total_tokens")):
+                input_tokens += int(tokens.get("input_tokens", 0))
+                output_tokens += int(tokens.get("output_tokens", 0))
+                total_tokens += int(tokens.get("total_tokens", 0))
+                reported_stage_count += 1
+
+    return {
+        "seconds_running": round(seconds_running, 3),
+        "tokens": {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": total_tokens,
+            "reported_stage_count": reported_stage_count,
+            "available": reported_stage_count > 0,
+        },
+    }
+
+
+def build_latest_outputs(cycle: dict[str, Any] | None) -> dict[str, dict[str, Any]]:
+    if not cycle:
+        return {}
+
+    latest_outputs: dict[str, dict[str, Any]] = {}
+    for stage in cycle.get("stage_details", []):
+        latest_outputs[stage["stage"]] = {
+            "cycle": cycle["cycle"],
+            "attempt": cycle.get("attempt", cycle["cycle"]),
+            "status": stage.get("status"),
+            "agent": stage.get("agent"),
+            "session_id": stage.get("session_id"),
+            "reported_session_id": stage.get("reported_session_id"),
+            "output_excerpt": stage.get("output_excerpt"),
+            "output_path": stage.get("assistant_output_path"),
+            "stdout_path": stage.get("stdout_path"),
+            "stderr_path": stage.get("stderr_path"),
+        }
+    return latest_outputs
+
+
 def build_stage_snapshot(
     config: WorkflowConfig,
     run_dir: Path,
@@ -104,16 +282,96 @@ def build_stage_snapshot(
     step_index: int,
 ) -> dict[str, Any]:
     stage_dir = run_dir / f"cycle-{cycle_number:02d}" / f"{step_index:02d}-{stage_name}"
-    command = (stage_dir / "command.txt").read_text(encoding="utf-8").strip() if (stage_dir / "command.txt").exists() else ""
-    elapsed_text = (stage_dir / "elapsed_sec.txt").read_text(encoding="utf-8").strip() if (stage_dir / "elapsed_sec.txt").exists() else ""
+    command = read_optional_text(stage_dir / "command.txt") or ""
+    elapsed_text = read_optional_text(stage_dir / "elapsed_sec.txt")
+    started_at = read_optional_text(stage_dir / "started_at.txt")
+    ended_at = read_optional_text(stage_dir / "ended_at.txt")
+    session_id = read_optional_text(stage_dir / "session_id.txt")
+    reported_session_id = read_optional_text(stage_dir / "reported_session_id.txt")
+    error = read_optional_text(stage_dir / "error.txt")
+    exit_code_text = read_optional_text(stage_dir / "exit_code.txt")
+    tokens = read_optional_json(stage_dir / "tokens.json") or {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "available": False,
+    }
+
     elapsed = float(elapsed_text) if elapsed_text else None
+    if elapsed is None and progress[cycle_number][stage_name] == STATUS_RUNNING:
+        started_dt = parse_iso_timestamp(started_at)
+        if started_dt is not None:
+            elapsed = round((datetime.now() - started_dt).total_seconds(), 3)
+
     return {
+        "cycle": cycle_number,
+        "attempt": cycle_number,
         "stage": stage_name,
         "status": progress[cycle_number][stage_name],
         "agent": config.stages[stage_name].agent,
+        "started_at": started_at,
+        "ended_at": ended_at,
         "elapsed_sec": elapsed,
         "command": command,
+        "session_id": session_id,
+        "reported_session_id": reported_session_id,
+        "display_session_id": reported_session_id or session_id,
+        "exit_code": int(exit_code_text) if exit_code_text and exit_code_text.lstrip("-").isdigit() else None,
+        "last_error": error,
+        "last_event": error or progress[cycle_number][stage_name],
+        "tokens": {
+            "input_tokens": int(tokens.get("input_tokens", 0)),
+            "output_tokens": int(tokens.get("output_tokens", 0)),
+            "total_tokens": int(tokens.get("total_tokens", 0)),
+            "available": bool(tokens.get("available")) or any(
+                int(tokens.get(key, 0)) for key in ("input_tokens", "output_tokens", "total_tokens")
+            ),
+        },
         "output_excerpt": read_stage_output_excerpt(stage_dir),
+        "prompt_path": find_prompt_path(stage_dir),
+        "assistant_output_path": str(stage_dir / "assistant_output.txt"),
+        "stdout_path": str(stage_dir / "stdout.txt"),
+        "stderr_path": str(stage_dir / "stderr.txt"),
+        "combined_log_path": str(stage_dir / "combined.log"),
+    }
+
+
+def prepare_stage_run(
+    stage: StageConfig,
+    agent: AgentConfig,
+    prompt: str,
+    stage_dir: Path,
+    session_id: str | None = None,
+) -> dict[str, Any]:
+    stage_dir.mkdir(parents=True, exist_ok=True)
+    prompt_suffix = stage.template_file.suffix or ".txt"
+    prompt_file = stage_dir / f"prompt{prompt_suffix}"
+    output_file = stage_dir / "assistant_output.txt"
+    session_id = session_id or str(uuid.uuid4())
+    started_at = datetime.now().isoformat(timespec="seconds")
+
+    prompt_file.write_text(prompt, encoding="utf-8")
+    (stage_dir / "stdout.txt").write_text("", encoding="utf-8")
+    (stage_dir / "stderr.txt").write_text("", encoding="utf-8")
+    (stage_dir / "combined.log").write_text("", encoding="utf-8")
+    (stage_dir / "session_id.txt").write_text(session_id, encoding="utf-8")
+    (stage_dir / "started_at.txt").write_text(started_at, encoding="utf-8")
+
+    command = [
+        part.replace("{prompt_file}", str(prompt_file))
+        .replace("{output_file}", str(output_file))
+        .replace("{stage_dir}", str(stage_dir))
+        .replace("{session_id}", session_id)
+        for part in agent.command
+    ]
+    (stage_dir / "command.txt").write_text(" ".join(shlex.quote(x) for x in command), encoding="utf-8")
+
+    return {
+        "prompt_file": prompt_file,
+        "output_file": output_file,
+        "session_id": session_id,
+        "started_at": started_at,
+        "command": command,
     }
 
 
@@ -284,18 +542,23 @@ def build_status_payload(
             build_stage_snapshot(config, run_dir, progress, cycle_number, stage_name, step_index)
             for step_index, stage_name in enumerate(REQUIRED_STAGES, start=1)
         ]
+        current_cycle_record = {
+            "cycle": cycle_number,
+            "attempt": record.get("attempt", cycle_number),
+            "retry_reason": record.get("retry_reason"),
+            "stages": stage_states,
+            "stage_details": stage_snapshots,
+            "issues": record.get("issues", []),
+            "issues_count": len(record.get("issues", [])),
+            "elapsed_sec": record.get("elapsed_sec"),
+            "verify_pass": record.get("verify_pass"),
+            "evaluate_pass": record.get("evaluate_pass"),
+            "stage_timings_sec": record.get("stage_timings_sec", {}),
+            "issue_delta": record.get("issue_delta", build_issue_delta([], record.get("issues", []))),
+            "session_ids": record.get("session_ids", {}),
+        }
         cycles.append(
-            {
-                "cycle": cycle_number,
-                "stages": stage_states,
-                "stage_details": stage_snapshots,
-                "issues": record.get("issues", []),
-                "issues_count": len(record.get("issues", [])),
-                "elapsed_sec": record.get("elapsed_sec"),
-                "verify_pass": record.get("verify_pass"),
-                "evaluate_pass": record.get("evaluate_pass"),
-                "stage_timings_sec": record.get("stage_timings_sec", {}),
-            }
+            current_cycle_record
         )
 
     active_run_cycle = active_cycle
@@ -319,26 +582,61 @@ def build_status_payload(
     )
     total_stage_count = config.max_cycles * len(REQUIRED_STAGES)
     latest_cycle = cycles[-1] if cycles else None
+    active_cycle_snapshot = next((cycle for cycle in cycles if cycle["cycle"] == active_run_cycle), None)
     evaluation_state = {
         "verify_pass": latest_cycle.get("verify_pass") if latest_cycle else None,
         "evaluate_pass": latest_cycle.get("evaluate_pass") if latest_cycle else None,
         "issues_count": latest_cycle.get("issues_count") if latest_cycle else 0,
         "issues": latest_cycle.get("issues", []) if latest_cycle else [],
     }
+    runtime_totals = accumulate_runtime_totals(cycles)
+    current_attempt = active_run_cycle or (latest_cycle["cycle"] if latest_cycle else 1)
+    current_cycle_record = active_cycle_snapshot or latest_cycle
+    next_attempt = None
+    if latest_cycle and not summary.get("completed") and latest_cycle["cycle"] < config.max_cycles:
+        next_attempt = {
+            "attempt": latest_cycle["cycle"] + 1,
+            "reason": build_retry_reason(latest_cycle),
+        }
+    latest_outputs = build_latest_outputs(active_cycle_snapshot or latest_cycle)
+    current_session = None
+    if active_cycle_snapshot and active_stage:
+        current_session = next(
+            (item for item in active_cycle_snapshot["stage_details"] if item["stage"] == active_stage),
+            None,
+        )
 
     what_happened = read_event_tail(run_dir, limit=6)
-    what_is_happening = (
-        f"Running cycle {active_cycle}, stage {active_stage}."
-        if active_cycle and active_stage
-        else "No stage is currently running."
-    )
-    what_happens_next = (
-        "Run completes if verify/evaluate leave no unresolved issues."
-        if summary.get("completed")
-        else (f"Next expected step: {next_stage}." if next_stage else "No further steps are queued.")
+    if active_cycle and active_stage:
+        agent_name = current_session.get("agent") if current_session else None
+        what_is_happening = (
+            f"Attempt {current_attempt} is running cycle {active_cycle}, stage {active_stage}"
+            + (f" via {agent_name}." if agent_name else ".")
+        )
+    elif latest_cycle:
+        what_is_happening = (
+            f"Latest completed cycle is {latest_cycle['cycle']} with {latest_cycle['issues_count']} unresolved issue(s)."
+        )
+    else:
+        what_is_happening = "No stage is currently running."
+
+    if summary.get("completed"):
+        what_happens_next = "Run completes because verify and evaluate left no unresolved issues."
+    elif next_attempt:
+        what_happens_next = (
+            f"Next expected step: cycle {next_attempt['attempt']} planning. Reason: {next_attempt['reason']}."
+        )
+    elif next_stage:
+        what_happens_next = f"Next expected step: {next_stage}."
+    else:
+        what_happens_next = "No further steps are queued."
+    last_event = what_happened[-1] if what_happened else None
+    last_error = summary.get("failure") or (
+        {"error": current_session.get("last_error")} if current_session and current_session.get("last_error") else None
     )
 
     return {
+        "schema_version": STATE_SCHEMA_VERSION,
         "run_id": run_dir.name,
         "state": state,
         "active_cycle": active_cycle,
@@ -359,12 +657,25 @@ def build_status_payload(
         "run_summary_file": str(run_dir / "run_summary.md"),
         "status_file": str(run_dir / "status.md"),
         "failure": summary.get("failure"),
+        "last_error": last_error,
+        "last_event": last_event,
         "history_loaded": summary.get("history_loaded", False),
-        "active_cycle_snapshot": next((cycle for cycle in cycles if cycle["cycle"] == active_run_cycle), None),
+        "attempts": {
+            "current": current_attempt,
+            "max": config.max_cycles,
+            "started_reason": current_cycle_record.get("retry_reason") if current_cycle_record else None,
+            "next": next_attempt,
+        },
+        "retry": next_attempt,
+        "runtime_totals": runtime_totals,
+        "latest_outputs": latest_outputs,
+        "current_session": current_session,
+        "active_cycle_snapshot": active_cycle_snapshot,
         "evaluation_state": evaluation_state,
         "what_happened": what_happened,
         "what_is_happening": what_is_happening,
         "what_happens_next": what_happens_next,
+        "latest_change": latest_cycle.get("issue_delta") if latest_cycle else None,
         "cycles": cycles,
         "recent_events": read_event_tail(run_dir),
     }
@@ -379,6 +690,15 @@ def render_status_markdown(
     active_cycle: int | None,
     active_stage: str | None,
 ) -> str:
+    payload = build_status_payload(
+        config=config,
+        run_dir=run_dir,
+        summary=summary,
+        progress=progress,
+        state=state,
+        active_cycle=active_cycle,
+        active_stage=active_stage,
+    )
     history_dir = get_history_dir(config)
     cycle_lookup = {cycle["cycle"]: cycle for cycle in summary.get("cycles", [])}
     started_cycles = [
@@ -398,7 +718,14 @@ def render_status_markdown(
         f"- Active: cycle {active_cycle} / {active_stage}"
         if active_cycle and active_stage
         else "- Active: idle",
+        f"- Attempt: {payload['attempts']['current']} / {payload['attempts']['max']}",
         f"- Started: {summary.get('started_at', 'n/a')}",
+        f"- Runtime: {payload['runtime_totals']['seconds_running']:.1f}s",
+        (
+            f"- Tokens: {payload['runtime_totals']['tokens']['total_tokens']} total"
+            if payload["runtime_totals"]["tokens"]["available"]
+            else "- Tokens: not reported"
+        ),
         f"- Max cycles: {config.max_cycles}",
         f"- Task brief: {config.task_prompt_file}",
         f"- Evaluation brief: {config.evaluation_prompt_file}",
@@ -427,6 +754,9 @@ def render_status_markdown(
         ]
     )
 
+    if payload["attempts"]["started_reason"]:
+        lines.extend(["", "## Attempt Context", "", f"- This attempt started because: {payload['attempts']['started_reason']}"])
+
     cycles = summary.get("cycles", [])
     if cycles:
         lines.extend(
@@ -434,13 +764,15 @@ def render_status_markdown(
                 "",
                 "## Issue Trend",
                 "",
-                "| Cycle | Count | Trend |",
-                "| --- | --- | --- |",
+                "| Cycle | Count | Trend | Change |",
+                "| --- | --- | --- | --- |",
             ]
         )
         for cycle in cycles:
             count = len(cycle["issues"])
-            lines.append(f"| {cycle['cycle']} | {count} | {render_issue_bar(count)} |")
+            lines.append(
+                f"| {cycle['cycle']} | {count} | {render_issue_bar(count)} | {cycle.get('issue_delta', {}).get('summary', '-')} |"
+            )
 
     if summary.get("failure"):
         lines.extend(["", "## Failure", "", f"- {summary['failure']['error']}"])
@@ -480,6 +812,19 @@ def write_status_files(
     config.artifacts_dir.mkdir(parents=True, exist_ok=True)
     (config.artifacts_dir / "latest_status.md").write_text(markdown, encoding="utf-8")
     (config.artifacts_dir / "latest_status.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    runtime_state = {
+        "schema_version": STATE_SCHEMA_VERSION,
+        "generated_at": payload["updated_at"],
+        "current_run_id": payload["run_id"],
+        "current_run_state": payload["state"],
+        "current_run_path": str(run_dir),
+        "runtime_totals": payload["runtime_totals"],
+        "current_run": payload,
+    }
+    (config.artifacts_dir / "runtime_state.json").write_text(
+        json.dumps(runtime_state, indent=2),
+        encoding="utf-8",
+    )
 
 
 def render_run_summary_markdown(
@@ -492,6 +837,13 @@ def render_run_summary_markdown(
 ) -> str:
     cycles = summary.get("cycles", [])
     total_elapsed = sum(float(cycle.get("elapsed_sec", 0)) for cycle in cycles)
+    token_total = 0
+    for cycle in cycles:
+        for stage_name in REQUIRED_STAGES:
+            tokens = read_optional_json(
+                run_dir / f"cycle-{cycle['cycle']:02d}" / f"{REQUIRED_STAGES.index(stage_name) + 1:02d}-{stage_name}" / "tokens.json"
+            ) or {}
+            token_total += int(tokens.get("total_tokens", 0))
     lines = [
         "# Run Summary",
         "",
@@ -500,6 +852,7 @@ def render_run_summary_markdown(
         f"- Started: {summary.get('started_at', 'n/a')}",
         f"- Ended: {summary.get('ended_at', 'n/a')}",
         f"- Approx elapsed: {total_elapsed:.1f}s",
+        f"- Reported tokens: {token_total}" if token_total else "- Reported tokens: not reported",
         f"- Task brief: {shorten_text(task_prompt)}",
         f"- Evaluation brief: {shorten_text(evaluation_prompt)}",
         f"- Status view: {run_dir / 'status.md'}",
@@ -512,8 +865,8 @@ def render_run_summary_markdown(
             [
                 "## Cycles",
                 "",
-                "| Cycle | Verify | Evaluate | Issues | Duration |",
-                "| --- | --- | --- | --- | --- |",
+                "| Cycle | Why It Ran | Verify | Evaluate | Issues | Change | Duration |",
+                "| --- | --- | --- | --- | --- | --- | --- |",
             ]
         )
         for cycle in cycles:
@@ -522,9 +875,11 @@ def render_run_summary_markdown(
                 + " | ".join(
                     [
                         str(cycle["cycle"]),
+                        cycle.get("retry_reason") or "initial",
                         "pass" if cycle["verify_pass"] else "fail",
                         "pass" if cycle["evaluate_pass"] else "fail",
                         str(len(cycle["issues"])),
+                        cycle.get("issue_delta", {}).get("summary", "-"),
                         f"{cycle['elapsed_sec']:.1f}s",
                     ]
                 )
@@ -620,69 +975,126 @@ def run_stage(
     agent: AgentConfig,
     prompt: str,
     stage_dir: Path,
+    invocation: dict[str, Any] | None = None,
 ) -> tuple[str, float]:
-    stage_dir.mkdir(parents=True, exist_ok=True)
-    prompt_suffix = stage.template_file.suffix or ".txt"
-    prompt_file = stage_dir / f"prompt{prompt_suffix}"
-    output_file = stage_dir / "assistant_output.txt"
-    session_id = str(uuid.uuid4())
-    prompt_file.write_text(prompt, encoding="utf-8")
-    (stage_dir / "session_id.txt").write_text(session_id, encoding="utf-8")
-
-    command = [
-        part.replace("{prompt_file}", str(prompt_file))
-        .replace("{output_file}", str(output_file))
-        .replace("{stage_dir}", str(stage_dir))
-        .replace("{session_id}", session_id)
-        for part in agent.command
-    ]
+    invocation = invocation or prepare_stage_run(stage, agent, prompt, stage_dir)
+    output_file = Path(invocation["output_file"])
+    command = list(invocation["command"])
 
     timeout = stage.timeout_sec or agent.timeout_sec
 
     t0 = time.monotonic()
+    proc: subprocess.Popen[str] | None = None
+    stdout_chunks: list[str] = []
+    stderr_chunks: list[str] = []
+    stdout_thread: threading.Thread | None = None
+    stderr_thread: threading.Thread | None = None
     try:
-        if agent.input_mode == "stdin":
-            proc = subprocess.run(
-                command,
-                input=prompt,
-                text=True,
-                capture_output=True,
-                timeout=timeout,
-            )
-        else:
-            proc = subprocess.run(
-                command,
-                text=True,
-                capture_output=True,
-                timeout=timeout,
-            )
+        proc = subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE if agent.input_mode == "stdin" else None,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+        assert proc.stdout is not None
+        assert proc.stderr is not None
+
+        stdout_thread = threading.Thread(
+            target=stream_pipe_to_files,
+            args=(stage_dir, proc.stdout, "stdout", stdout_chunks),
+            daemon=True,
+        )
+        stderr_thread = threading.Thread(
+            target=stream_pipe_to_files,
+            args=(stage_dir, proc.stderr, "stderr", stderr_chunks),
+            daemon=True,
+        )
+        stdout_thread.start()
+        stderr_thread.start()
+
+        if agent.input_mode == "stdin" and proc.stdin is not None:
+            proc.stdin.write(prompt)
+            proc.stdin.close()
+
+        proc.wait(timeout=timeout)
     except FileNotFoundError as exc:
+        (stage_dir / "error.txt").write_text(
+            f"Command not found for agent {agent.name!r}: {command[0]!r}.",
+            encoding="utf-8",
+        )
         raise WorkflowError(f"Command not found for agent {agent.name!r}: {command[0]!r}.") from exc
     except subprocess.TimeoutExpired as exc:
+        if proc is not None:
+            proc.kill()
+            proc.wait()
+        if stdout_thread is not None:
+            stdout_thread.join()
+        if stderr_thread is not None:
+            stderr_thread.join()
+        ended_at = datetime.now().isoformat(timespec="seconds")
+        (stage_dir / "ended_at.txt").write_text(ended_at, encoding="utf-8")
+        (stage_dir / "elapsed_sec.txt").write_text(str(round(time.monotonic() - t0, 3)), encoding="utf-8")
+        (stage_dir / "error.txt").write_text(
+            f"Stage {stage.name!r} timed out after {timeout}s while running {agent.name!r}.",
+            encoding="utf-8",
+        )
         raise WorkflowError(
             f"Stage {stage.name!r} timed out after {timeout}s while running {agent.name!r}."
         ) from exc
     finally:
         elapsed = round(time.monotonic() - t0, 3)
 
-    (stage_dir / "stdout.txt").write_text(proc.stdout or "", encoding="utf-8")
-    (stage_dir / "stderr.txt").write_text(proc.stderr or "", encoding="utf-8")
+    if stdout_thread is not None:
+        stdout_thread.join()
+    if stderr_thread is not None:
+        stderr_thread.join()
+
+    stdout_text = "".join(stdout_chunks)
+    stderr_text = "".join(stderr_chunks)
+    ended_at = datetime.now().isoformat(timespec="seconds")
+    (stage_dir / "ended_at.txt").write_text(ended_at, encoding="utf-8")
     (stage_dir / "exit_code.txt").write_text(str(proc.returncode), encoding="utf-8")
-    (stage_dir / "command.txt").write_text(" ".join(shlex.quote(x) for x in command), encoding="utf-8")
     (stage_dir / "elapsed_sec.txt").write_text(str(elapsed), encoding="utf-8")
 
+    combined_output = "\n".join(
+        part for part in [stdout_text, stderr_text, read_optional_text(output_file) or ""] if part
+    )
+    reported_session_id = extract_reported_session_id(combined_output)
+    if reported_session_id:
+        (stage_dir / "reported_session_id.txt").write_text(reported_session_id, encoding="utf-8")
+
+    token_totals = extract_token_totals(combined_output) or {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+    }
+    token_totals["available"] = any(
+        int(token_totals.get(key, 0)) for key in ("input_tokens", "output_tokens", "total_tokens")
+    )
+    (stage_dir / "tokens.json").write_text(json.dumps(token_totals, indent=2), encoding="utf-8")
+
     if proc.returncode != 0:
-        stderr_tail = (proc.stderr or "").strip().splitlines()[-1] if proc.stderr else ""
-        raise WorkflowError(
+        stderr_tail = stderr_text.strip().splitlines()[-1] if stderr_text else ""
+        error_message = (
             f"Stage {stage.name!r} failed with exit code {proc.returncode}. {stderr_tail}".strip()
+        )
+        (stage_dir / "error.txt").write_text(error_message, encoding="utf-8")
+        raise WorkflowError(
+            error_message
         )
 
     if output_file.exists():
         cleaned = output_file.read_text(encoding="utf-8").strip()
         if cleaned:
+            if (stage_dir / "error.txt").exists():
+                (stage_dir / "error.txt").unlink()
             return cleaned, elapsed
 
-    return (proc.stdout or "").strip(), elapsed
+    if (stage_dir / "error.txt").exists():
+        (stage_dir / "error.txt").unlink()
+    return stdout_text.strip(), elapsed
 
 
 def run_workflow(config: WorkflowConfig, run_name: str | None = None) -> Path:
@@ -736,7 +1148,10 @@ def run_workflow(config: WorkflowConfig, run_name: str | None = None) -> Path:
         cycle_dir.mkdir(parents=True, exist_ok=True)
         stage_outputs: dict[str, str] = {}
         stage_timings: dict[str, float] = {}
+        session_ids: dict[str, str | None] = {}
         cycle_t0 = time.monotonic()
+        previous_cycle = summary["cycles"][-1] if summary["cycles"] else None
+        retry_reason = build_retry_reason(previous_cycle)
 
         try:
             for step_index, stage_name in enumerate(REQUIRED_STAGES, start=1):
@@ -745,6 +1160,8 @@ def run_workflow(config: WorkflowConfig, run_name: str | None = None) -> Path:
                 stage_dir = cycle_dir / f"{step_index:02d}-{stage_name}"
                 context = build_cycle_context(base_context, stage_outputs, cycle, config.max_cycles)
                 prompt = render_prompt(stage.template_file, context)
+                invocation = prepare_stage_run(stage, agent, prompt, stage_dir)
+                session_ids[stage_name] = invocation["session_id"]
 
                 progress[cycle][stage_name] = STATUS_RUNNING
                 write_status_files(
@@ -759,7 +1176,7 @@ def run_workflow(config: WorkflowConfig, run_name: str | None = None) -> Path:
 
                 print(f"[cycle {cycle}] {stage_name} -> {agent.name}")
                 append_event(run_dir, f"cycle {cycle} stage {stage_name} started via {agent.name}")
-                output, elapsed = run_stage(stage, agent, prompt, stage_dir)
+                output, elapsed = run_stage(stage, agent, prompt, stage_dir, invocation=invocation)
                 stage_outputs[stage_name] = output
                 stage_timings[stage_name] = elapsed
                 progress[cycle][stage_name] = STATUS_COMPLETED
@@ -778,7 +1195,16 @@ def run_workflow(config: WorkflowConfig, run_name: str | None = None) -> Path:
 
         except WorkflowError as exc:
             progress[cycle][stage_name] = STATUS_FAILED
-            summary["failure"] = {"cycle": cycle, "error": str(exc)}
+            failed_stage_dir = cycle_dir / f"{step_index:02d}-{stage_name}"
+            summary["failure"] = {
+                "cycle": cycle,
+                "attempt": cycle,
+                "stage": stage_name,
+                "agent": stage.agent,
+                "session_id": read_optional_text(failed_stage_dir / "session_id.txt"),
+                "reported_session_id": read_optional_text(failed_stage_dir / "reported_session_id.txt"),
+                "error": str(exc),
+            }
             summary["completed"] = False
             summary["ended_at"] = datetime.now().isoformat(timespec="seconds")
             append_event(run_dir, f"cycle {cycle} stage {stage_name} failed: {exc}")
@@ -819,11 +1245,15 @@ def run_workflow(config: WorkflowConfig, run_name: str | None = None) -> Path:
         cycle_elapsed = round(time.monotonic() - cycle_t0, 3)
         cycle_record = {
             "cycle": cycle,
+            "attempt": cycle,
+            "retry_reason": retry_reason,
             "verify_pass": verify_pass,
             "evaluate_pass": eval_pass,
             "issues": unresolved,
+            "issue_delta": build_issue_delta(previous_cycle["issues"], unresolved) if previous_cycle else build_issue_delta([], unresolved),
             "elapsed_sec": cycle_elapsed,
             "stage_timings_sec": stage_timings,
+            "session_ids": session_ids,
         }
         summary["cycles"].append(cycle_record)
 

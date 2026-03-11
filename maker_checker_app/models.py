@@ -6,6 +6,7 @@ from typing import Any
 
 
 REQUIRED_STAGES = ("plan", "critique", "revise", "execute", "verify", "evaluate")
+STATE_SCHEMA_VERSION = "v1"
 DEFAULT_TASK_BRIEF = "briefs/task.md"
 DEFAULT_EVALUATION_BRIEF = "briefs/evaluation.md"
 DEFAULT_HISTORY_DIR = "memory"
