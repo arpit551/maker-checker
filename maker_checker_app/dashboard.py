@@ -1,622 +1,19 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime
 import json
+import mimetypes
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 from .config import get_history_dir, load_config
-from .models import WorkflowConfig
+from .models import REQUIRED_STAGES, STATE_SCHEMA_VERSION, WorkflowConfig
 from .runtime import load_history_entries
 
 
-HTML = """<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Maker Checker Control Room</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
-  <style>
-    :root {
-      --bg: #f3ede3;
-      --panel: rgba(255, 250, 242, 0.88);
-      --line: rgba(121, 98, 74, 0.22);
-      --text: #181512;
-      --muted: #6a5d50;
-      --accent: #c45d29;
-      --accent-2: #147364;
-      --warn: #a53e2c;
-      --idle: #7d7368;
-      --shadow: 0 18px 42px rgba(59, 40, 20, 0.08);
-    }
-    * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      min-height: 100vh;
-      color: var(--text);
-      font-family: "IBM Plex Sans", sans-serif;
-      background:
-        radial-gradient(circle at top left, rgba(196, 93, 41, 0.18), transparent 26%),
-        radial-gradient(circle at top right, rgba(20, 115, 100, 0.14), transparent 24%),
-        linear-gradient(180deg, #f8f1e7 0%, var(--bg) 100%);
-    }
-    .shell {
-      max-width: 1440px;
-      margin: 0 auto;
-      padding: 26px 18px 42px;
-    }
-    .hero {
-      display: flex;
-      justify-content: space-between;
-      align-items: end;
-      gap: 18px;
-      margin-bottom: 22px;
-    }
-    .hero h1 {
-      margin: 0;
-      font-size: clamp(2rem, 4vw, 3.9rem);
-      line-height: 0.93;
-      letter-spacing: -0.05em;
-    }
-    .hero p {
-      margin: 12px 0 0;
-      max-width: 72ch;
-      color: var(--muted);
-    }
-    .pill {
-      display: inline-flex;
-      gap: 8px;
-      align-items: center;
-      padding: 10px 14px;
-      border-radius: 999px;
-      background: var(--panel);
-      border: 1px solid var(--line);
-      box-shadow: var(--shadow);
-      font-family: "IBM Plex Mono", monospace;
-      font-size: 12px;
-    }
-    .layout {
-      display: grid;
-      grid-template-columns: 320px minmax(0, 1fr);
-      gap: 18px;
-    }
-    .panel {
-      background: var(--panel);
-      border: 1px solid var(--line);
-      border-radius: 22px;
-      box-shadow: var(--shadow);
-      padding: 18px;
-      backdrop-filter: blur(10px);
-    }
-    .panel h2 {
-      margin: 0 0 12px;
-      font-size: 0.92rem;
-      letter-spacing: 0.08em;
-      text-transform: uppercase;
-      color: var(--muted);
-    }
-    .sidebar {
-      display: grid;
-      gap: 18px;
-      align-self: start;
-      position: sticky;
-      top: 18px;
-    }
-    .run-list {
-      display: grid;
-      gap: 10px;
-    }
-    .run-button {
-      border: 1px solid var(--line);
-      background: rgba(255,255,255,0.75);
-      border-radius: 16px;
-      padding: 12px 14px;
-      text-align: left;
-      cursor: pointer;
-      font: inherit;
-      color: inherit;
-      transition: transform 120ms ease, border-color 120ms ease, box-shadow 120ms ease;
-    }
-    .run-button:hover {
-      transform: translateY(-1px);
-      border-color: var(--accent);
-    }
-    .run-button.active {
-      border-color: var(--accent);
-      box-shadow: inset 0 0 0 1px var(--accent);
-    }
-    .run-button strong {
-      display: block;
-      font-size: 0.98rem;
-    }
-    .run-meta {
-      margin-top: 7px;
-      display: flex;
-      justify-content: space-between;
-      gap: 8px;
-      color: var(--muted);
-      font-size: 12px;
-    }
-    .content {
-      display: grid;
-      gap: 18px;
-    }
-    .metric-grid {
-      display: grid;
-      grid-template-columns: repeat(5, minmax(0, 1fr));
-      gap: 12px;
-    }
-    .metric {
-      background: rgba(255,255,255,0.72);
-      border: 1px solid var(--line);
-      border-radius: 16px;
-      padding: 14px;
-    }
-    .metric label {
-      display: block;
-      font-size: 11px;
-      letter-spacing: 0.08em;
-      text-transform: uppercase;
-      color: var(--muted);
-      margin-bottom: 8px;
-    }
-    .metric strong {
-      display: block;
-      font-size: 1.25rem;
-      letter-spacing: -0.03em;
-    }
-    .progress-wrap {
-      display: grid;
-      gap: 10px;
-      margin-top: 12px;
-    }
-    .bar {
-      width: 100%;
-      height: 12px;
-      border-radius: 999px;
-      background: rgba(104, 92, 79, 0.12);
-      overflow: hidden;
-    }
-    .bar > span {
-      display: block;
-      height: 100%;
-      background: linear-gradient(90deg, var(--accent), #f08a44);
-      border-radius: 999px;
-      transition: width 240ms ease;
-    }
-    .story-grid {
-      display: grid;
-      grid-template-columns: repeat(3, minmax(0, 1fr));
-      gap: 12px;
-    }
-    .story {
-      border-radius: 18px;
-      padding: 16px;
-      border: 1px solid var(--line);
-      background: rgba(255,255,255,0.72);
-    }
-    .story h3 {
-      margin: 0 0 10px;
-      font-size: 12px;
-      text-transform: uppercase;
-      letter-spacing: 0.08em;
-      color: var(--muted);
-    }
-    .story ul {
-      margin: 0;
-      padding-left: 18px;
-    }
-    .story li {
-      margin: 0 0 8px;
-    }
-    .duo {
-      display: grid;
-      grid-template-columns: minmax(0, 1.15fr) minmax(300px, 0.85fr);
-      gap: 18px;
-    }
-    table {
-      width: 100%;
-      border-collapse: collapse;
-      font-size: 14px;
-    }
-    th, td {
-      text-align: left;
-      padding: 10px 12px;
-      border-bottom: 1px solid rgba(121, 98, 74, 0.14);
-      vertical-align: top;
-    }
-    th {
-      font-size: 11px;
-      text-transform: uppercase;
-      letter-spacing: 0.08em;
-      color: var(--muted);
-    }
-    .token {
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      min-width: 58px;
-      padding: 6px 8px;
-      border-radius: 999px;
-      font-size: 11px;
-      font-family: "IBM Plex Mono", monospace;
-      text-transform: uppercase;
-      letter-spacing: 0.08em;
-      background: rgba(125, 115, 104, 0.12);
-      color: var(--idle);
-    }
-    .token.run { background: rgba(20, 115, 100, 0.12); color: var(--accent-2); }
-    .token.done { background: rgba(20, 115, 100, 0.18); color: var(--accent-2); }
-    .token.fail { background: rgba(165, 62, 44, 0.14); color: var(--warn); }
-    .token.todo { background: rgba(125, 115, 104, 0.12); color: var(--idle); }
-    .stage-cards, .history-cards, .issues {
-      display: grid;
-      gap: 10px;
-    }
-    .stage-card, .history-card, .issue-card {
-      border-radius: 16px;
-      border: 1px solid var(--line);
-      background: rgba(255,255,255,0.72);
-      padding: 14px;
-    }
-    .stage-head, .history-head {
-      display: flex;
-      justify-content: space-between;
-      gap: 10px;
-      align-items: center;
-      margin-bottom: 10px;
-    }
-    .small {
-      font-size: 12px;
-      color: var(--muted);
-    }
-    .mono {
-      font-family: "IBM Plex Mono", monospace;
-      font-size: 12px;
-      white-space: pre-wrap;
-      word-break: break-word;
-    }
-    .log, .summary {
-      min-height: 240px;
-      border-radius: 18px;
-      padding: 16px;
-      background: #171614;
-      color: #f8f3ea;
-      white-space: pre-wrap;
-      font-family: "IBM Plex Mono", monospace;
-      font-size: 12px;
-      line-height: 1.65;
-      overflow: auto;
-    }
-    .empty {
-      padding: 22px;
-      border: 1px dashed var(--line);
-      border-radius: 16px;
-      color: var(--muted);
-      text-align: center;
-    }
-    @media (max-width: 1120px) {
-      .layout, .duo, .story-grid, .metric-grid { grid-template-columns: 1fr; }
-      .sidebar { position: static; }
-      .hero { flex-direction: column; align-items: start; }
-    }
-  </style>
-</head>
-<body>
-  <div class="shell">
-    <div class="hero">
-      <div>
-        <h1>Maker Checker<br>Control Room</h1>
-        <p>Live local view of what happened, what is happening, what happens next, and where the run stands on verification and evaluation.</p>
-      </div>
-      <div class="pill">Auto refresh <span id="refreshTick">2s</span></div>
-    </div>
-
-    <div class="layout">
-      <aside class="sidebar">
-        <section class="panel">
-          <h2>Runs</h2>
-          <div id="runList" class="run-list"></div>
-        </section>
-        <section class="panel">
-          <h2>Recent Learnings</h2>
-          <div id="historyCards" class="history-cards"></div>
-        </section>
-      </aside>
-
-      <main class="content">
-        <section class="panel">
-          <h2>Live Snapshot</h2>
-          <div class="metric-grid">
-            <div class="metric"><label>Run</label><strong id="runId">-</strong></div>
-            <div class="metric"><label>State</label><strong id="runState">-</strong></div>
-            <div class="metric"><label>Active</label><strong id="activeStage">-</strong></div>
-            <div class="metric"><label>Next</label><strong id="nextStage">-</strong></div>
-            <div class="metric"><label>Evaluation</label><strong id="evaluationState">-</strong></div>
-          </div>
-          <div class="progress-wrap">
-            <div class="small" id="stageProgressText">0 / 0 stages complete</div>
-            <div class="bar"><span id="stageProgressBar" style="width:0%"></span></div>
-          </div>
-        </section>
-
-        <section class="panel">
-          <h2>Run Story</h2>
-          <div class="story-grid">
-            <div class="story">
-              <h3>What Happened</h3>
-              <ul id="whatHappened"></ul>
-            </div>
-            <div class="story">
-              <h3>What Is Happening</h3>
-              <div id="whatIsHappening"></div>
-            </div>
-            <div class="story">
-              <h3>What Happens Next</h3>
-              <div id="whatHappensNext"></div>
-            </div>
-          </div>
-        </section>
-
-        <section class="duo">
-          <section class="panel">
-            <h2>Cycle Grid</h2>
-            <div id="progressTable"></div>
-          </section>
-          <section class="panel">
-            <h2>Evaluation Position</h2>
-            <div class="metric-grid" style="grid-template-columns: repeat(3, minmax(0, 1fr));">
-              <div class="metric"><label>Verify</label><strong id="verifyState">-</strong></div>
-              <div class="metric"><label>Evaluate</label><strong id="evaluateState">-</strong></div>
-              <div class="metric"><label>Issues</label><strong id="issueCount">-</strong></div>
-            </div>
-            <div id="issueList" class="issues" style="margin-top: 12px;"></div>
-          </section>
-        </section>
-
-        <section class="duo">
-          <section class="panel">
-            <h2>Stage Detail</h2>
-            <div id="stageCards" class="stage-cards"></div>
-          </section>
-          <section class="panel">
-            <h2>Runtime Log</h2>
-            <div id="eventLog" class="log"></div>
-          </section>
-        </section>
-
-        <section class="duo">
-          <section class="panel">
-            <h2>Summary</h2>
-            <div id="runSummary" class="summary"></div>
-          </section>
-          <section class="panel">
-            <h2>Paths</h2>
-            <div class="stage-cards">
-              <div class="stage-card">
-                <div class="small">Task brief</div>
-                <div id="taskBriefPath" class="mono"></div>
-              </div>
-              <div class="stage-card">
-                <div class="small">Evaluation brief</div>
-                <div id="evaluationBriefPath" class="mono"></div>
-              </div>
-              <div class="stage-card">
-                <div class="small">Run summary file</div>
-                <div id="runSummaryPath" class="mono"></div>
-              </div>
-              <div class="stage-card">
-                <div class="small">History file</div>
-                <div id="historyPath" class="mono"></div>
-              </div>
-            </div>
-          </section>
-        </section>
-      </main>
-    </div>
-  </div>
-  <script>
-    const refreshMs = 2000;
-    let selectedRun = null;
-
-    function esc(value) {
-      return String(value ?? "").replace(/[&<>"]/g, ch => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;" }[ch]));
-    }
-
-    function tokenClass(value) {
-      return `token ${value || "todo"}`;
-    }
-
-    async function fetchJson(url) {
-      const res = await fetch(url, { cache: "no-store" });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      return await res.json();
-    }
-
-    async function fetchText(url) {
-      const res = await fetch(url, { cache: "no-store" });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      return await res.text();
-    }
-
-    function setText(id, value) {
-      document.getElementById(id).textContent = value ?? "-";
-    }
-
-    function renderRuns(runs) {
-      const root = document.getElementById("runList");
-      if (!runs.length) {
-        root.innerHTML = '<div class="empty">No runs yet.</div>';
-        return;
-      }
-      const valid = runs.some(run => run.run_id === selectedRun);
-      if (!valid) selectedRun = runs[0].run_id;
-      root.innerHTML = runs.map(run => `
-        <button class="run-button ${run.run_id === selectedRun ? "active" : ""}" data-run="${esc(run.run_id)}">
-          <strong>${esc(run.run_id)}</strong>
-          <div class="run-meta">
-            <span>${esc(run.state || "unknown")}</span>
-            <span>${esc(run.updated_at || run.started_at || "-")}</span>
-          </div>
-        </button>
-      `).join("");
-      root.querySelectorAll(".run-button").forEach(button => {
-        button.onclick = () => {
-          selectedRun = button.dataset.run;
-          refresh();
-        };
-      });
-    }
-
-    function renderStoryList(id, items) {
-      const root = document.getElementById(id);
-      if (!items || !items.length) {
-        root.innerHTML = '<li class="small">No events yet.</li>';
-        return;
-      }
-      root.innerHTML = items.map(item => `<li>${esc(item)}</li>`).join("");
-    }
-
-    function renderProgress(status) {
-      const root = document.getElementById("progressTable");
-      if (!status.cycles || !status.cycles.length) {
-        root.innerHTML = '<div class="empty">No cycle data yet.</div>';
-        return;
-      }
-      const stageNames = ["plan", "critique", "revise", "execute", "verify", "evaluate"];
-      const rows = status.cycles.map(cycle => `
-        <tr>
-          <td>${cycle.cycle}</td>
-          ${stageNames.map(stage => `<td><span class="${tokenClass(cycle.stages[stage])}">${esc(cycle.stages[stage])}</span></td>`).join("")}
-          <td>${cycle.issues_count}</td>
-          <td>${cycle.elapsed_sec == null ? "-" : `${cycle.elapsed_sec.toFixed(1)}s`}</td>
-        </tr>
-      `).join("");
-      root.innerHTML = `
-        <table>
-          <thead>
-            <tr>
-              <th>Cycle</th>
-              ${stageNames.map(stage => `<th>${stage}</th>`).join("")}
-              <th>Issues</th>
-              <th>Duration</th>
-            </tr>
-          </thead>
-          <tbody>${rows}</tbody>
-        </table>
-      `;
-    }
-
-    function renderIssues(status) {
-      const root = document.getElementById("issueList");
-      const issues = status.evaluation_state?.issues || [];
-      if (!issues.length) {
-        root.innerHTML = '<div class="empty">No unresolved issues in the current cycle.</div>';
-        return;
-      }
-      root.innerHTML = issues.map(issue => `<div class="issue-card">${esc(issue)}</div>`).join("");
-    }
-
-    function renderStageCards(status) {
-      const root = document.getElementById("stageCards");
-      const cycle = status.active_cycle_snapshot || (status.cycles?.length ? status.cycles[status.cycles.length - 1] : null);
-      if (!cycle || !cycle.stage_details || !cycle.stage_details.length) {
-        root.innerHTML = '<div class="empty">No stage detail yet.</div>';
-        return;
-      }
-      root.innerHTML = cycle.stage_details.map(stage => `
-        <div class="stage-card">
-          <div class="stage-head">
-            <div>
-              <strong>${esc(stage.stage)}</strong>
-              <div class="small">agent: ${esc(stage.agent)}${stage.elapsed_sec == null ? "" : ` | ${stage.elapsed_sec.toFixed(1)}s`}</div>
-            </div>
-            <span class="${tokenClass(stage.status)}">${esc(stage.status)}</span>
-          </div>
-          <div class="small">command</div>
-          <div class="mono">${esc(stage.command || "-")}</div>
-          <div class="small" style="margin-top: 10px;">output excerpt</div>
-          <div class="mono">${esc(stage.output_excerpt || "No output yet.")}</div>
-        </div>
-      `).join("");
-    }
-
-    function renderHistory(entries) {
-      const root = document.getElementById("historyCards");
-      if (!entries.length) {
-        root.innerHTML = '<div class="empty">No historical learnings yet.</div>';
-        return;
-      }
-      root.innerHTML = entries.map(entry => `
-        <div class="history-card">
-          <div class="history-head">
-            <strong>${esc(entry.run_id)}</strong>
-            <span class="small">${esc(entry.outcome)}</span>
-          </div>
-          <div class="small">Trend: ${esc(entry.issue_trend)}</div>
-          <div style="margin-top:8px;">${esc((entry.next_run_notes || []).join(" | ") || "No carry-forward note.")}</div>
-        </div>
-      `).join("");
-    }
-
-    function renderStatus(status, summary) {
-      setText("runId", status.run_id || "-");
-      setText("runState", status.state || "-");
-      setText("activeStage", status.active_stage ? `cycle ${status.active_cycle} / ${status.active_stage}` : "idle");
-      setText("nextStage", status.next_stage || "none");
-      setText("evaluationState", status.evaluation_state?.evaluate_pass === true ? "pass" : status.evaluation_state?.evaluate_pass === false ? "fail" : "pending");
-      setText("verifyState", status.evaluation_state?.verify_pass === true ? "pass" : status.evaluation_state?.verify_pass === false ? "fail" : "pending");
-      setText("evaluateState", status.evaluation_state?.evaluate_pass === true ? "pass" : status.evaluation_state?.evaluate_pass === false ? "fail" : "pending");
-      setText("issueCount", status.evaluation_state?.issues_count ?? 0);
-      setText("taskBriefPath", status.task_brief_path || "-");
-      setText("evaluationBriefPath", status.evaluation_brief_path || "-");
-      setText("runSummaryPath", status.run_summary_file || "-");
-      setText("historyPath", status.history_file || "-");
-
-      const completed = status.stage_position?.completed || 0;
-      const total = status.stage_position?.total || 0;
-      const percent = total ? Math.round((completed / total) * 100) : 0;
-      setText("stageProgressText", `${completed} / ${total} stages complete`);
-      document.getElementById("stageProgressBar").style.width = `${percent}%`;
-
-      renderStoryList("whatHappened", status.what_happened || []);
-      document.getElementById("whatIsHappening").textContent = status.what_is_happening || "-";
-      document.getElementById("whatHappensNext").textContent = status.what_happens_next || "-";
-      document.getElementById("eventLog").textContent = (status.recent_events || []).join("\\n") || "No events yet.";
-      document.getElementById("runSummary").textContent = summary || "No summary yet.";
-      renderProgress(status);
-      renderIssues(status);
-      renderStageCards(status);
-    }
-
-    async function refresh() {
-      try {
-        const runs = await fetchJson("/api/runs");
-        renderRuns(runs);
-        const runQuery = selectedRun ? `?run=${encodeURIComponent(selectedRun)}` : "";
-        const [status, summary, history] = await Promise.all([
-          fetchJson(`/api/status${runQuery}`),
-          fetchText(`/api/summary${runQuery}`),
-          fetchJson("/api/history"),
-        ]);
-        renderStatus(status, summary);
-        renderHistory(history);
-      } catch (err) {
-        document.getElementById("eventLog").textContent = `Dashboard error: ${err.message}`;
-      }
-    }
-
-    document.getElementById("refreshTick").textContent = `${refreshMs / 1000}s`;
-    refresh();
-    setInterval(refresh, refreshMs);
-  </script>
-</body>
-</html>
-"""
+STATIC_DIR = Path(__file__).resolve().parent / "dashboard_static"
 
 
 def parse_args() -> argparse.Namespace:
@@ -627,8 +24,63 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def list_runs(config: WorkflowConfig) -> list[dict[str, str | None]]:
-    runs: list[dict[str, str | None]] = []
+def read_text(path: Path) -> str:
+    if not path.exists():
+        return ""
+    return path.read_text(encoding="utf-8")
+
+
+def build_idle_run_detail(config: WorkflowConfig) -> dict:
+    return {
+        "schema_version": STATE_SCHEMA_VERSION,
+        "run_id": None,
+        "state": "idle",
+        "active_cycle": None,
+        "active_stage": None,
+        "next_stage": None,
+        "started_at": None,
+        "ended_at": None,
+        "updated_at": None,
+        "stage_position": {"completed": 0, "total": 0},
+        "evaluation_state": {
+            "verify_pass": None,
+            "evaluate_pass": None,
+            "issues_count": 0,
+            "issues": [],
+        },
+        "attempts": {"current": 0, "max": config.max_cycles, "started_reason": None, "next": None},
+        "retry": None,
+        "runtime_totals": {
+            "seconds_running": 0.0,
+            "tokens": {
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "total_tokens": 0,
+                "reported_stage_count": 0,
+                "available": False,
+            },
+        },
+        "latest_outputs": {},
+        "current_session": None,
+        "what_happened": [],
+        "what_is_happening": "No run activity yet.",
+        "what_happens_next": "Start a run to populate the dashboard.",
+        "cycles": [],
+        "recent_events": [],
+        "summary_markdown": "No summary yet.",
+        "history_file": str(get_history_dir(config) / "run_history.md"),
+        "task_brief_path": str(config.task_prompt_file),
+        "evaluation_brief_path": str(config.evaluation_prompt_file),
+        "run_summary_file": None,
+        "status_file": None,
+        "last_event": None,
+        "last_error": None,
+        "latest_change": None,
+    }
+
+
+def list_runs(config: WorkflowConfig) -> list[dict[str, object]]:
+    runs: list[dict[str, object]] = []
     if not config.artifacts_dir.exists():
         return runs
 
@@ -642,58 +94,245 @@ def list_runs(config: WorkflowConfig) -> list[dict[str, str | None]]:
             status = json.loads(status_path.read_text(encoding="utf-8"))
         elif summary_path.exists():
             status = json.loads(summary_path.read_text(encoding="utf-8"))
+
+        evaluation = status.get("evaluation_state", {})
+        runtime_totals = status.get("runtime_totals", {})
         runs.append(
             {
+                "schema_version": status.get("schema_version", STATE_SCHEMA_VERSION),
                 "run_id": path.name,
                 "state": status.get("state") or ("completed" if status.get("completed") else "incomplete"),
                 "started_at": status.get("started_at"),
                 "updated_at": status.get("updated_at") or status.get("ended_at"),
+                "active_cycle": status.get("active_cycle"),
+                "active_stage": status.get("active_stage"),
+                "issues_count": evaluation.get("issues_count", 0),
+                "last_error": status.get("last_error"),
+                "last_event": status.get("last_event"),
+                "seconds_running": runtime_totals.get("seconds_running", 0.0),
             }
         )
     return runs
 
 
-def load_status(config: WorkflowConfig, run_id: str | None) -> dict:
+def load_run_detail(config: WorkflowConfig, run_id: str | None) -> dict:
     if run_id:
-        path = config.artifacts_dir / run_id / "status.json"
+        run_dir = config.artifacts_dir / run_id
+        path = run_dir / "status.json"
     else:
         path = config.artifacts_dir / "latest_status.json"
+        run_dir = None
     if not path.exists():
-        return {
-            "run_id": None,
-            "state": "idle",
-            "active_cycle": None,
-            "active_stage": None,
-            "next_stage": None,
-            "updated_at": None,
-            "stage_position": {"completed": 0, "total": 0},
-            "evaluation_state": {"verify_pass": None, "evaluate_pass": None, "issues_count": 0, "issues": []},
-            "what_happened": [],
-            "what_is_happening": "No run activity yet.",
-            "what_happens_next": "Start a run to populate the dashboard.",
-            "cycles": [],
-            "recent_events": [],
-        }
-    return json.loads(path.read_text(encoding="utf-8"))
+        return build_idle_run_detail(config)
 
-
-def load_summary_text(config: WorkflowConfig, run_id: str | None) -> str:
-    if run_id:
-        path = config.artifacts_dir / run_id / "run_summary.md"
+    detail = json.loads(path.read_text(encoding="utf-8"))
+    if run_dir is None and detail.get("run_id"):
+        run_dir = config.artifacts_dir / detail["run_id"]
+    if run_dir is not None:
+        summary_path = run_dir / "run_summary.md"
+        detail["summary_markdown"] = read_text(summary_path) or "No summary yet."
     else:
-        latest = load_status(config, None).get("run_id")
-        path = (
-            config.artifacts_dir / latest / "run_summary.md"
-            if latest
-            else config.artifacts_dir / "latest_summary.md"
-        )
-    if not path.exists():
-        return "No summary yet."
-    return path.read_text(encoding="utf-8")
+        detail["summary_markdown"] = "No summary yet."
+    return detail
+
+
+def load_status(config: WorkflowConfig, run_id: str | None) -> dict:
+    return load_run_detail(config, run_id)
 
 
 def load_history(config: WorkflowConfig, limit: int = 8) -> list[dict]:
     return load_history_entries(get_history_dir(config))[-limit:][::-1]
+
+
+def select_current_run_id(runs: list[dict[str, object]]) -> str | None:
+    running = next((run for run in runs if run.get("state") == "running"), None)
+    if running:
+        return str(running["run_id"])
+    if runs:
+        return str(runs[0]["run_id"])
+    return None
+
+
+def load_runtime_state(config: WorkflowConfig) -> dict:
+    path = config.artifacts_dir / "runtime_state.json"
+    if path.exists():
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            pass
+
+    runs = list_runs(config)
+    current_run_id = select_current_run_id(runs)
+    return {
+        "schema_version": STATE_SCHEMA_VERSION,
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "current_run_id": current_run_id,
+        "current_run_state": runs[0]["state"] if runs else "idle",
+        "current_run_path": str(config.artifacts_dir / current_run_id) if current_run_id else None,
+        "current_run": load_run_detail(config, current_run_id),
+    }
+
+
+def build_state_payload(config: WorkflowConfig) -> dict:
+    runtime_state = load_runtime_state(config)
+    runs = list_runs(config)
+    current_run_id = runtime_state.get("current_run_id") or select_current_run_id(runs)
+    current_run = load_run_detail(config, current_run_id)
+    return {
+        "schema_version": STATE_SCHEMA_VERSION,
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "current_run_id": current_run_id,
+        "current_run": current_run,
+        "runs": runs,
+        "history": load_history(config),
+    }
+
+
+def load_summary_text(config: WorkflowConfig, run_id: str | None) -> str:
+    return load_run_detail(config, run_id).get("summary_markdown", "No summary yet.")
+
+
+def get_stage_dir(run_dir: Path, cycle: int, stage_name: str) -> Path:
+    step_index = REQUIRED_STAGES.index(stage_name) + 1
+    return run_dir / f"cycle-{cycle:02d}" / f"{step_index:02d}-{stage_name}"
+
+
+def read_stage_log_file(path: Path, limit: int | None = None) -> str:
+    text = read_text(path)
+    if limit is not None and limit > 0 and len(text) > limit:
+        return text[-limit:]
+    return text
+
+
+def resolve_stage_context(config: WorkflowConfig, run_id: str, cycle: int | None, stage_name: str) -> tuple[dict, dict | None, dict | None, Path]:
+    if stage_name not in REQUIRED_STAGES:
+        raise ValueError(stage_name)
+
+    run_dir = config.artifacts_dir / run_id
+    if not run_dir.exists():
+        raise FileNotFoundError(run_id)
+
+    detail = load_run_detail(config, run_id)
+    if cycle is None:
+        cycle = detail.get("active_cycle") or (detail.get("cycles", [{}])[-1].get("cycle") if detail.get("cycles") else None)
+    if cycle is None:
+        raise FileNotFoundError("cycle")
+
+    cycle_record = next((item for item in detail.get("cycles", []) if item.get("cycle") == int(cycle)), None)
+    if cycle_record is None:
+        raise FileNotFoundError("cycle")
+    stage_record = next((item for item in cycle_record.get("stage_details", []) if item.get("stage") == stage_name), None)
+    if stage_record is None:
+        raise FileNotFoundError(stage_name)
+
+    stage_dir = get_stage_dir(run_dir, int(cycle), stage_name)
+    return detail, cycle_record, stage_record, stage_dir
+
+
+def load_stage_logs(
+    config: WorkflowConfig,
+    run_id: str,
+    cycle: int | None,
+    stage_name: str,
+    limit: int | None = None,
+) -> dict:
+    detail, _, stage_record, stage_dir = resolve_stage_context(config, run_id, cycle, stage_name)
+    stream_files = {
+        "assistant_output": stage_dir / "assistant_output.txt",
+        "stdout": stage_dir / "stdout.txt",
+        "stderr": stage_dir / "stderr.txt",
+        "combined": stage_dir / "combined.log",
+    }
+    streams: dict[str, dict[str, object]] = {}
+    for stream_name, path in stream_files.items():
+        streams[stream_name] = {
+            "path": str(path),
+            "exists": path.exists(),
+            "text": read_stage_log_file(path, limit=limit),
+            "bytes": path.stat().st_size if path.exists() else 0,
+        }
+
+    cycle_value = stage_record["cycle"]
+    return {
+        "run_id": run_id,
+        "cycle": cycle_value,
+        "stage": stage_name,
+        "status": stage_record.get("status"),
+        "agent": stage_record.get("agent"),
+        "session_id": stage_record.get("session_id"),
+        "reported_session_id": stage_record.get("reported_session_id"),
+        "active": detail.get("active_cycle") == cycle_value and detail.get("active_stage") == stage_name,
+        "paths": {name: data["path"] for name, data in streams.items()},
+        "streams": streams,
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+    }
+
+
+def load_stage_detail(
+    config: WorkflowConfig,
+    run_id: str,
+    cycle: int | None,
+    stage_name: str,
+) -> dict:
+    detail, cycle_record, stage_record, stage_dir = resolve_stage_context(config, run_id, cycle, stage_name)
+    prompt_path = next(iter(sorted(stage_dir.glob("prompt*"))), None)
+    assistant_output = read_text(stage_dir / "assistant_output.txt")
+    stdout_text = read_text(stage_dir / "stdout.txt")
+    stderr_text = read_text(stage_dir / "stderr.txt")
+    prompt_text = read_text(prompt_path) if prompt_path is not None else ""
+    combined_text = read_text(stage_dir / "combined.log")
+    primary_output = assistant_output or stdout_text or stderr_text
+
+    return {
+        "schema_version": STATE_SCHEMA_VERSION,
+        "run_id": run_id,
+        "cycle": cycle_record["cycle"],
+        "stage": stage_name,
+        "status": stage_record.get("status"),
+        "agent": stage_record.get("agent"),
+        "session_id": stage_record.get("session_id"),
+        "reported_session_id": stage_record.get("reported_session_id"),
+        "display_session_id": stage_record.get("display_session_id"),
+        "started_at": stage_record.get("started_at"),
+        "ended_at": stage_record.get("ended_at"),
+        "elapsed_sec": stage_record.get("elapsed_sec"),
+        "command": stage_record.get("command"),
+        "last_error": stage_record.get("last_error"),
+        "exit_code": stage_record.get("exit_code"),
+        "tokens": stage_record.get("tokens", {}),
+        "paths": {
+            "prompt": str(prompt_path) if prompt_path is not None else None,
+            "assistant_output": str(stage_dir / "assistant_output.txt"),
+            "stdout": str(stage_dir / "stdout.txt"),
+            "stderr": str(stage_dir / "stderr.txt"),
+            "combined": str(stage_dir / "combined.log"),
+        },
+        "content": {
+            "prompt": prompt_text,
+            "assistant_output": assistant_output,
+            "stdout": stdout_text,
+            "stderr": stderr_text,
+            "combined": combined_text,
+            "primary_output": primary_output,
+        },
+        "active": detail.get("active_cycle") == cycle_record["cycle"] and detail.get("active_stage") == stage_name,
+    }
+
+
+def _json_error(code: str, message: str) -> dict:
+    return {"error": {"code": code, "message": message}}
+
+
+def _static_path(request_path: str) -> Path | None:
+    if request_path in {"/", "/index.html"}:
+        return STATIC_DIR / "index.html"
+    if request_path.startswith("/static/"):
+        relative = request_path.removeprefix("/static/")
+        candidate = (STATIC_DIR / relative).resolve()
+        if STATIC_DIR.resolve() not in candidate.parents and candidate != STATIC_DIR.resolve():
+            return None
+        return candidate
+    return None
 
 
 def make_handler(config: WorkflowConfig):
@@ -709,28 +348,102 @@ def make_handler(config: WorkflowConfig):
             self.end_headers()
             self.wfile.write(body)
 
+        def _send_json(self, payload: object, status: int = 200) -> None:
+            self._send(json.dumps(payload).encode("utf-8"), "application/json; charset=utf-8", status=status)
+
+        def _send_file(self, path: Path) -> None:
+            if not path.exists() or not path.is_file():
+                self._send_json(_json_error("not_found", "Asset not found"), status=404)
+                return
+            mime = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+            self._send(path.read_bytes(), f"{mime}; charset=utf-8" if mime.startswith("text/") or mime == "application/javascript" else mime)
+
         def do_GET(self) -> None:  # noqa: N802
             parsed = urlparse(self.path)
             params = parse_qs(parsed.query)
             run_id = params.get("run", [None])[0]
+            cycle_param = params.get("cycle", [None])[0]
+            limit_param = params.get("limit", [None])[0]
 
-            if parsed.path == "/":
-                self._send(HTML.encode("utf-8"), "text/html; charset=utf-8")
+            static_path = _static_path(parsed.path)
+            if static_path is not None:
+                self._send_file(static_path)
                 return
+
+            if parsed.path == "/api/v1/state":
+                self._send_json(build_state_payload(config))
+                return
+            if parsed.path == "/api/v1/runs":
+                self._send_json(list_runs(config))
+                return
+            if parsed.path == "/api/v1/history":
+                self._send_json(load_history(config))
+                return
+            if parsed.path.startswith("/api/v1/runs/"):
+                suffix = unquote(parsed.path.removeprefix("/api/v1/runs/"))
+                try:
+                    cycle_value = int(cycle_param) if cycle_param is not None else None
+                except ValueError:
+                    self._send_json(_json_error("invalid_cycle", "cycle must be an integer"), status=400)
+                    return
+                try:
+                    limit_value = int(limit_param) if limit_param is not None else None
+                except ValueError:
+                    self._send_json(_json_error("invalid_limit", "limit must be an integer"), status=400)
+                    return
+
+                if "/stages/" in suffix:
+                    requested_run_id, stage_suffix = suffix.split("/stages/", 1)
+                    if not (config.artifacts_dir / requested_run_id).exists():
+                        self._send_json(_json_error("not_found", "Run not found"), status=404)
+                        return
+                    if stage_suffix.endswith("/logs"):
+                        requested_stage = stage_suffix.removesuffix("/logs")
+                        try:
+                            self._send_json(load_stage_logs(config, requested_run_id, cycle_value, requested_stage, limit_value))
+                        except FileNotFoundError:
+                            self._send_json(_json_error("not_found", "Stage logs not found"), status=404)
+                        except ValueError:
+                            self._send_json(_json_error("invalid_stage", "Unknown stage"), status=400)
+                        return
+
+                    requested_stage = stage_suffix.rstrip("/")
+                    try:
+                        self._send_json(load_stage_detail(config, requested_run_id, cycle_value, requested_stage))
+                    except FileNotFoundError:
+                        self._send_json(_json_error("not_found", "Stage detail not found"), status=404)
+                    except ValueError:
+                        self._send_json(_json_error("invalid_stage", "Unknown stage"), status=400)
+                    return
+
+                if suffix.endswith("/summary"):
+                    requested_run_id = suffix.removesuffix("/summary")
+                    if not (config.artifacts_dir / requested_run_id).exists():
+                        self._send_json(_json_error("not_found", "Run not found"), status=404)
+                        return
+                    self._send(load_summary_text(config, requested_run_id).encode("utf-8"), "text/plain; charset=utf-8")
+                    return
+
+                if not (config.artifacts_dir / suffix).exists():
+                    self._send_json(_json_error("not_found", "Run not found"), status=404)
+                    return
+                self._send_json(load_run_detail(config, suffix))
+                return
+
             if parsed.path == "/api/runs":
-                self._send(json.dumps(list_runs(config)).encode("utf-8"), "application/json")
+                self._send_json(list_runs(config))
                 return
             if parsed.path == "/api/status":
-                self._send(json.dumps(load_status(config, run_id)).encode("utf-8"), "application/json")
+                self._send_json(load_status(config, run_id))
                 return
             if parsed.path == "/api/history":
-                self._send(json.dumps(load_history(config)).encode("utf-8"), "application/json")
+                self._send_json(load_history(config))
                 return
             if parsed.path == "/api/summary":
                 self._send(load_summary_text(config, run_id).encode("utf-8"), "text/plain; charset=utf-8")
                 return
 
-            self._send(b"Not found", "text/plain; charset=utf-8", status=404)
+            self._send_json(_json_error("not_found", "Not found"), status=404)
 
     return Handler
 
