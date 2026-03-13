@@ -17,6 +17,7 @@ DEFAULT_GIT_MODE = "worktree"
 DEFAULT_GIT_BASE_REF = "HEAD"
 DEFAULT_WORKTREES_DIRNAME = "worktrees"
 DEFAULT_GIT_APPLY_ON_SUCCESS = False
+DEFAULT_GIT_LINKED_PATHS = (".env", ".env.local", ".env.development", ".env.test")
 GIT_MODES = ("worktree", "inplace")
 
 STATUS_PENDING = "pending"
@@ -62,6 +63,7 @@ class GitConfig:
     base_ref: str = DEFAULT_GIT_BASE_REF
     worktrees_dir: Path | None = None
     apply_on_success: bool = DEFAULT_GIT_APPLY_ON_SUCCESS
+    linked_paths: tuple[str, ...] = DEFAULT_GIT_LINKED_PATHS
 
 
 @dataclass

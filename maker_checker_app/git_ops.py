@@ -21,6 +21,7 @@ CHECKPOINT_ENV = {
 class GitRunContext:
     mode: str
     repo_root: Path
+    project_dir: Path
     base_ref: str
     base_commit: str
     cwd: Path
@@ -30,6 +31,35 @@ class GitRunContext:
     checkpoints: list[dict[str, Any]] = field(default_factory=list)
     rollbacks: list[dict[str, Any]] = field(default_factory=list)
     apply_result: dict[str, Any] | None = None
+
+
+def _project_relative_path(project_dir: Path, repo_root: Path) -> Path:
+    try:
+        relative = project_dir.resolve().relative_to(repo_root.resolve())
+    except ValueError as exc:
+        raise WorkflowError(f"Project directory {project_dir} is not inside git repo {repo_root}.") from exc
+    return relative
+
+
+def _sync_linked_paths(source_project_dir: Path, target_project_dir: Path, linked_paths: tuple[str, ...]) -> list[str]:
+    synced: list[str] = []
+    for raw_path in linked_paths:
+        relative_path = Path(raw_path)
+        source_path = source_project_dir / relative_path
+        if not source_path.exists() and not source_path.is_symlink():
+            continue
+        target_path = target_project_dir / relative_path
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        if target_path.exists() or target_path.is_symlink():
+            try:
+                if target_path.is_symlink() and target_path.resolve() == source_path.resolve():
+                    synced.append(raw_path)
+            except OSError:
+                pass
+            continue
+        target_path.symlink_to(source_path, target_is_directory=source_path.is_dir())
+        synced.append(raw_path)
+    return synced
 
 
 def run_git(args: list[str], cwd: Path, env: dict[str, str] | None = None) -> str:
@@ -87,16 +117,19 @@ def sanitize_branch_suffix(value: str) -> str:
 
 
 def create_run_context(project_dir: Path, git_config: GitConfig, run_id: str) -> GitRunContext:
+    project_dir = project_dir.resolve()
     repo_root = resolve_repo_root(project_dir)
     base_commit = resolve_commit(repo_root, git_config.base_ref)
+    project_relative = _project_relative_path(project_dir, repo_root)
 
     if git_config.mode == "inplace":
         return GitRunContext(
             mode="inplace",
             repo_root=repo_root,
+            project_dir=project_dir,
             base_ref=git_config.base_ref,
             base_commit=base_commit,
-            cwd=project_dir.resolve(),
+            cwd=project_dir,
             current_checkpoint=base_commit,
         )
 
@@ -108,12 +141,15 @@ def create_run_context(project_dir: Path, git_config: GitConfig, run_id: str) ->
     worktree_path = worktrees_dir / run_id
     branch = f"maker-checker/{sanitize_branch_suffix(run_id)}"
     run_git(["worktree", "add", "-b", branch, str(worktree_path), base_commit], cwd=repo_root)
+    worktree_project_dir = (worktree_path / project_relative).resolve()
+    _sync_linked_paths(project_dir, worktree_project_dir, git_config.linked_paths)
     return GitRunContext(
         mode="worktree",
         repo_root=repo_root,
+        project_dir=project_dir,
         base_ref=git_config.base_ref,
         base_commit=base_commit,
-        cwd=worktree_path,
+        cwd=worktree_project_dir,
         branch=branch,
         worktree_path=worktree_path,
         current_checkpoint=base_commit,
@@ -219,6 +255,7 @@ def describe_context(context: GitRunContext) -> dict[str, Any]:
     return {
         "mode": context.mode,
         "repo_root": str(context.repo_root),
+        "project_dir": str(context.project_dir),
         "base_ref": context.base_ref,
         "base_commit": context.base_commit,
         "cwd": str(context.cwd),

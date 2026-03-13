@@ -16,10 +16,10 @@ from .models import DEFAULT_CONFIG_FILE, REQUIRED_STAGES, STATE_SCHEMA_VERSION, 
 from .runtime import (
     RUN_PROCESS_FILE,
     build_status_payload,
+    format_stage_log_text,
     init_progress,
     load_history_entries,
     render_run_summary_markdown,
-    strip_codex_log_noise,
     write_status_files,
 )
 
@@ -461,7 +461,7 @@ def load_stage_logs(
         streams[stream_name] = {
             "path": str(path),
             "exists": path.exists(),
-            "text": strip_codex_log_noise(text, stream_name),
+            "text": format_stage_log_text(text, stream_name),
             "bytes": path.stat().st_size if path.exists() else 0,
         }
 
@@ -490,10 +490,10 @@ def load_stage_detail(
     detail, cycle_record, stage_record, stage_dir = resolve_stage_context(config, run_id, cycle, stage_name)
     prompt_path = next(iter(sorted(stage_dir.glob("prompt*"))), None)
     assistant_output = read_text(stage_dir / "assistant_output.txt")
-    stdout_text = read_text(stage_dir / "stdout.txt")
-    stderr_text = strip_codex_log_noise(read_text(stage_dir / "stderr.txt"), "stderr")
+    stdout_text = format_stage_log_text(read_text(stage_dir / "stdout.txt"), "stdout")
+    stderr_text = format_stage_log_text(read_text(stage_dir / "stderr.txt"), "stderr")
     prompt_text = read_text(prompt_path) if prompt_path is not None else ""
-    combined_text = strip_codex_log_noise(read_text(stage_dir / "combined.log"), "combined")
+    combined_text = format_stage_log_text(read_text(stage_dir / "combined.log"), "combined")
     primary_output = assistant_output or stdout_text or stderr_text
 
     return {

@@ -13,6 +13,7 @@ from .models import (
     DEFAULT_EVALUATION_BRIEF,
     DEFAULT_GIT_BASE_REF,
     DEFAULT_GIT_APPLY_ON_SUCCESS,
+    DEFAULT_GIT_LINKED_PATHS,
     DEFAULT_GIT_MODE,
     DEFAULT_HISTORY_DIR,
     DEFAULT_HISTORY_LIMIT,
@@ -46,6 +47,22 @@ def _ensure_list_command(raw: Any, field_name: str) -> list[str]:
     if isinstance(raw, list) and raw and all(isinstance(x, str) and x for x in raw):
         return raw
     raise WorkflowError(f"{field_name} must be a command string or non-empty list of strings.")
+
+
+def _ensure_relative_path_list(raw: Any, field_name: str) -> tuple[str, ...]:
+    if raw is None:
+        return DEFAULT_GIT_LINKED_PATHS
+    if not isinstance(raw, list) or not raw:
+        raise WorkflowError(f"{field_name} must be a non-empty list of relative paths if provided.")
+    normalized: list[str] = []
+    for value in raw:
+        if not isinstance(value, str) or not value.strip():
+            raise WorkflowError(f"{field_name} entries must be non-empty strings.")
+        path = Path(value.strip())
+        if path.is_absolute():
+            raise WorkflowError(f"{field_name} entries must be relative paths, got {value!r}.")
+        normalized.append(value.strip())
+    return tuple(normalized)
 
 
 def get_history_dir(config: WorkflowConfig) -> Path:
@@ -170,6 +187,7 @@ def load_config(config_path: Path) -> WorkflowConfig:
     git_apply_on_success_raw = git_raw.get("apply_on_success", DEFAULT_GIT_APPLY_ON_SUCCESS)
     if not isinstance(git_apply_on_success_raw, bool):
         raise WorkflowError("git.apply_on_success must be a boolean if provided.")
+    git_linked_paths = _ensure_relative_path_list(git_raw.get("linked_paths"), "git.linked_paths")
 
     return WorkflowConfig(
         max_cycles=max_cycles,
@@ -187,5 +205,6 @@ def load_config(config_path: Path) -> WorkflowConfig:
             base_ref=git_base_ref.strip(),
             worktrees_dir=git_worktrees_dir,
             apply_on_success=git_apply_on_success_raw,
+            linked_paths=git_linked_paths,
         ),
     )

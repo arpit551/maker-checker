@@ -6,6 +6,9 @@ Revise the plan using the critique and recent run memory.
 ## Task Brief
 {task_prompt}
 
+## Evaluation Brief
+{evaluation_prompt}
+
 ## Recent Run Memory
 {recent_run_memory}
 
@@ -25,6 +28,8 @@ Revise the plan using the critique and recent run memory.
 - Add research or inspection steps only where they materially change correctness, risk, or implementation choices.
 - Remove duplicated or low-leverage steps so the plan stays lean.
 - Do not inspect or modify repository state while revising.
+- Replace user-directed follow-up questions with direct checks, safe defaults, or explicit blocker branches whenever possible.
+- Preserve any explicit verification command, budget, or artifact requirement from the evaluation brief unless the critique gives a grounded reason to change it.
 - If the critique contains ungrounded claims, drop them rather than carrying them forward.
 
 ## Output Requirements

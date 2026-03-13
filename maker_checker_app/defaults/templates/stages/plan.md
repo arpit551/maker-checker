@@ -6,6 +6,9 @@ Produce the next implementation plan.
 ## Task Brief
 {task_prompt}
 
+## Evaluation Brief
+{evaluation_prompt}
+
 ## Recent Run Memory
 {recent_run_memory}
 
@@ -22,7 +25,10 @@ Produce the next implementation plan.
 - Use only the provided text context.
 - Do not invent repository facts, files, commits, logs, prior runs, test coverage, or environment state that were not provided.
 - Start from the task brief, discovery findings, recent run memory, unresolved issues, and previous plan.
+- If the evaluation brief specifies an exact verification command, budget, or artifact requirement, align the plan to it by default and justify any broader reproduction separately.
+- If later steps depend on credentials, devices, local services, or external tooling, make the first step a preflight check and include an explicit blocker branch instead of assuming success.
 - If the next step depends on inspecting the repository, logs, runtime artifacts, or current docs, say exactly what should be checked during execution. Do not pretend that work already happened.
+- Do not tell the executor to ask the user for routine runtime details mid-run. Prefer a direct check, a safe default, or an explicit blocker branch.
 - Prefer the smallest maintainable path that can be verified clearly.
 - Keep the plan concise and concrete. Do not restate the full brief.
 - Call out unknowns and evidence needed instead of guessing.

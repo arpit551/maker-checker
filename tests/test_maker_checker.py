@@ -13,6 +13,7 @@ import pytest
 import maker_checker as mc
 from maker_checker_app import dashboard as dash
 from maker_checker_app import bootstrap as bootstrap
+from maker_checker_app import runtime as runtime_mod
 
 
 # ---------------------------------------------------------------------------
@@ -150,6 +151,7 @@ class TestLoadConfig:
         assert cfg.history_limit == mc.DEFAULT_HISTORY_LIMIT
         assert cfg.git.mode == mc.DEFAULT_GIT_MODE
         assert cfg.git.base_ref == mc.DEFAULT_GIT_BASE_REF
+        assert cfg.git.linked_paths == mc.DEFAULT_GIT_LINKED_PATHS
         assert "mock" in cfg.agents
         assert set(cfg.stages.keys()) == set(mc.REQUIRED_STAGES)
 
@@ -335,6 +337,18 @@ class TestLoadConfig:
             assert loaded.stages[stage_name].template_file.exists()
             assert f"/defaults/templates/stages/{stage_name}.md" in str(loaded.stages[stage_name].template_file)
 
+    def test_custom_git_linked_paths_are_loaded(self, minimal_config_toml: Path):
+        text = minimal_config_toml.read_text() + '\n[git]\nlinked_paths = [".env", "config/local.env"]\n'
+        minimal_config_toml.write_text(text)
+        loaded = mc.load_config(minimal_config_toml)
+        assert loaded.git.linked_paths == (".env", "config/local.env")
+
+    def test_git_linked_paths_reject_absolute_paths(self, minimal_config_toml: Path):
+        text = minimal_config_toml.read_text() + '\n[git]\nlinked_paths = ["/tmp/secret.env"]\n'
+        minimal_config_toml.write_text(text)
+        with pytest.raises(mc.WorkflowError, match="relative paths"):
+            mc.load_config(minimal_config_toml)
+
 
 # ---------------------------------------------------------------------------
 # read_text_file
@@ -355,6 +369,20 @@ class TestReadTextFile:
         f.write_text("   \n  ")
         with pytest.raises(mc.WorkflowError, match="is empty"):
             mc.read_text_file(f, "test")
+
+
+class TestRuntimeHelpers:
+    def test_find_recent_workspace_activity_prefers_non_ignored_files(self, tmp_path: Path):
+        (tmp_path / ".venv").mkdir()
+        (tmp_path / ".venv" / "ignored.txt").write_text("ignore me\n")
+        (tmp_path / "output").mkdir()
+        activity = tmp_path / "output" / "crawl_stdout.log"
+        activity.write_text("use me\n")
+
+        relative, mtime = runtime_mod.find_recent_workspace_activity(tmp_path, 0.0)
+
+        assert relative == "output/crawl_stdout.log"
+        assert isinstance(mtime, float)
 
 
 # ---------------------------------------------------------------------------
@@ -569,6 +597,22 @@ class TestBuildIssueDelta:
 # ---------------------------------------------------------------------------
 
 class TestRunStage:
+    def test_supports_useful_output_watchdog_only_for_codex_json(self):
+        assert mc.supports_useful_output_watchdog(["codex", "exec", "--json", "-"]) is True
+        assert mc.supports_useful_output_watchdog(["codex", "exec", "-"]) is False
+        assert mc.supports_useful_output_watchdog(["claude", "-p"]) is False
+
+    def test_prepare_stage_run_injects_codex_json_flag(self, tmp_path: Path):
+        stage = mc.StageConfig(name="plan", agent="codex", template_file=Path("x"))
+        agent = mc.AgentConfig(
+            name="codex",
+            command=["codex", "exec", "-o", "{output_file}", "-"],
+            input_mode="stdin",
+            timeout_sec=5,
+        )
+        invocation = mc.prepare_stage_run(stage, agent, "prompt", tmp_path / "stage")
+        assert invocation["command"][:3] == ["codex", "exec", "--json"]
+
     def test_stdin_mode_captures_stdout(self, tmp_path: Path):
         stage = mc.StageConfig(name="test", agent="a", template_file=Path("x"))
         agent = mc.AgentConfig(name="a", command=["cat"], input_mode="stdin", timeout_sec=5)
@@ -608,8 +652,25 @@ class TestRunStage:
         agent = mc.AgentConfig(
             name="a", command=["sleep", "60"], input_mode="stdin", timeout_sec=1
         )
-        with pytest.raises(mc.WorkflowError, match="timed out|no useful output"):
+        with pytest.raises(mc.WorkflowError, match="timed out"):
             mc.run_stage(stage, agent, "", tmp_path / "stage")
+
+    def test_codex_like_agent_uses_no_output_watchdog(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        script = tmp_path / "codex"
+        script.write_text("#!/usr/bin/env bash\nexec sleep 60\n", encoding="utf-8")
+        script.chmod(0o755)
+
+        stage = mc.StageConfig(name="plan", agent="codex", template_file=Path("x"), timeout_sec=5)
+        agent = mc.AgentConfig(
+            name="codex",
+            command=[str(script), "exec", "-"],
+            input_mode="stdin",
+            timeout_sec=5,
+        )
+        monkeypatch.setattr(runtime_mod, "INITIAL_USEFUL_OUTPUT_TIMEOUT_SEC", 1)
+
+        with pytest.raises(mc.WorkflowError, match="no useful output"):
+            mc.run_stage(stage, agent, "prompt", tmp_path / "stage")
 
     def test_output_file_preferred_over_stdout(self, tmp_path: Path):
         stage_dir = tmp_path / "stage"
@@ -995,6 +1056,57 @@ class TestRunWorkflow:
         assert (tmp_workspace / "state.txt").read_text() == "baseline\n"
         assert (worktree_path / "state.txt").read_text() == "baseline\nchanged\n"
 
+    def test_run_links_local_env_files_into_worktree(self, tmp_workspace: Path):
+        (tmp_workspace / ".env").write_text("API_KEY=present\n", encoding="utf-8")
+        mock_script = tmp_workspace / "mock_linked_env.sh"
+        mock_script.write_text(textwrap.dedent("""\
+            #!/usr/bin/env bash
+            prompt="$(cat)"
+            stage="$(printf '%s\\n' "$prompt" | awk -F': ' '/^STAGE: / {print tolower($2); exit}')"
+            case "$stage" in
+              execute)
+                if [ -L .env ] && [ "$(cat .env)" = "API_KEY=present" ]; then
+                  echo "linked env visible"
+                else
+                  echo "linked env missing"
+                  exit 1
+                fi
+                ;;
+              verify|evaluate) echo '{"pass": true, "issues": []}' ;;
+              *) echo "output for $stage" ;;
+            esac
+        """))
+        mock_script.chmod(0o755)
+
+        cfg = mc.WorkflowConfig(
+            max_cycles=1,
+            artifacts_dir=tmp_workspace / "runs",
+            task_prompt_file=tmp_workspace / "inputs" / "task_prompt.txt",
+            evaluation_prompt_file=tmp_workspace / "inputs" / "evaluation_prompt.txt",
+            agents={"mock": mc.AgentConfig(
+                name="mock",
+                command=[str(mock_script)],
+                input_mode="stdin",
+                timeout_sec=10,
+            )},
+            stages={
+                name: mc.StageConfig(
+                    name=name,
+                    agent="mock",
+                    template_file=tmp_workspace / "prompts" / "stages" / f"{name}.txt",
+                )
+                for name in mc.REQUIRED_STAGES
+            },
+        )
+
+        run_dir = mc.run_workflow(cfg, run_name="linked-env")
+        summary = json.loads((run_dir / "summary.json").read_text())
+        worktree_path = Path(summary["workspace"]["cwd"])
+
+        assert summary["completed"] is True
+        assert (worktree_path / ".env").is_symlink()
+        assert (worktree_path / ".env").resolve() == (tmp_workspace / ".env").resolve()
+
     def test_successful_run_can_apply_changes_back_to_base_checkout(self, tmp_workspace: Path):
         mock_script = tmp_workspace / "mock_apply_back.sh"
         mock_script.write_text(textwrap.dedent("""\
@@ -1205,6 +1317,11 @@ class TestDashboardHelpers:
         (stage_dir / "stdout.txt").write_text("")
         (stage_dir / "stderr.txt").write_text("")
         (stage_dir / "combined.log").write_text("")
+        (stage_dir / "heartbeat.json").write_text(json.dumps({
+            "updated_at": "2026-03-12T00:28:11",
+            "elapsed_sec": 12.0,
+            "message": "activity: updated output/postfix/crawl_stdout.log",
+        }))
 
         summary = {
             "started_at": "2020-01-01T00:00:00",
@@ -1244,6 +1361,7 @@ class TestDashboardHelpers:
 
         assert detail["active_stage"] == "plan"
         assert detail["last_event"] == "[2026-03-12T00:28:10] cycle 1 stage plan started via codex"
+        assert detail["current_session"]["last_event"] == "activity: updated output/postfix/crawl_stdout.log"
         assert detail["runtime_totals"]["seconds_running"] > 0
         assert detail["what_happens_next"] == "Next expected step: plan."
 
@@ -1398,6 +1516,82 @@ class TestDashboardHelpers:
         assert "Prompt body" not in logs["streams"]["combined"]["text"]
         assert detail["content"]["stderr"].strip() == "real stderr line"
 
+    def test_load_stage_logs_pretty_formats_codex_json_events(self, tmp_workspace: Path):
+        cfg = mc.WorkflowConfig(
+            max_cycles=1,
+            artifacts_dir=tmp_workspace / "runs",
+            task_prompt_file=tmp_workspace / "inputs" / "task_prompt.txt",
+            evaluation_prompt_file=tmp_workspace / "inputs" / "evaluation_prompt.txt",
+            agents={"codex": mc.AgentConfig(
+                name="codex",
+                command=["echo", "hi"],
+                input_mode="stdin",
+                timeout_sec=10,
+            )},
+            stages={
+                name: mc.StageConfig(
+                    name=name,
+                    agent="codex",
+                    template_file=tmp_workspace / "prompts" / "stages" / f"{name}.txt",
+                )
+                for name in mc.REQUIRED_STAGES
+            },
+        )
+
+        run_dir = tmp_workspace / "runs" / "20260312-json-logs"
+        stage_dir = run_dir / "cycle-01" / "02-plan"
+        stage_dir.mkdir(parents=True)
+        summary = {
+            "started_at": "2020-01-01T00:00:00",
+            "cycles": [{
+                "cycle": 1,
+                "attempt": 1,
+                "stages": {"plan": mc.STATUS_RUNNING},
+                "issues": [],
+                "elapsed_sec": 2.0,
+            }],
+            "completed": False,
+            "failure": None,
+            "history_loaded": False,
+            "workspace": None,
+        }
+        progress = mc.init_progress(1)
+        progress[1]["plan"] = mc.STATUS_RUNNING
+        mc.write_status_files(
+            config=cfg,
+            run_dir=run_dir,
+            summary=summary,
+            progress=progress,
+            state="running",
+            active_cycle=1,
+            active_stage="plan",
+        )
+        (stage_dir / "stdout.txt").write_text(
+            '{"type":"thread.started","thread_id":"thread-123"}\n'
+            '{"type":"item.started","item":{"type":"command_execution","command":"echo hi","status":"in_progress"}}\n'
+            '{"type":"item.completed","item":{"type":"command_execution","command":"echo hi","status":"completed","exit_code":0,"aggregated_output":"hi"}}\n'
+            '{"type":"item.completed","item":{"type":"agent_message","text":"Discovery complete."}}\n'
+            '{"type":"turn.completed","usage":{"input_tokens":11,"output_tokens":7,"total_tokens":18}}\n',
+            encoding="utf-8",
+        )
+        (stage_dir / "combined.log").write_text(
+            '[stdout] {"type":"thread.started","thread_id":"thread-123"}\n'
+            '[stdout] {"type":"item.started","item":{"type":"command_execution","command":"echo hi","status":"in_progress"}}\n'
+            '[stdout] {"type":"item.completed","item":{"type":"command_execution","command":"echo hi","status":"completed","exit_code":0,"aggregated_output":"hi"}}\n',
+            encoding="utf-8",
+        )
+
+        logs = dash.load_stage_logs(cfg, run_dir.name, 1, "plan")
+        detail = dash.load_stage_detail(cfg, run_dir.name, 1, "plan")
+
+        assert "thread started: thread-123" in logs["streams"]["stdout"]["text"]
+        assert "command started: echo hi" in logs["streams"]["stdout"]["text"]
+        assert "command completed (exit 0): echo hi" in logs["streams"]["stdout"]["text"]
+        assert "Discovery complete." in logs["streams"]["stdout"]["text"]
+        assert "turn completed | tokens in 11 out 7 total 18" in logs["streams"]["stdout"]["text"]
+        assert "[stdout] thread started: thread-123" in logs["streams"]["combined"]["text"]
+        assert detail["content"]["primary_output"].startswith("thread started: thread-123")
+
     def test_pending_stage_detail_returns_empty_payload(self, tmp_workspace: Path):
         cfg = mc.WorkflowConfig(
             max_cycles=1,
@@ -1538,6 +1732,18 @@ class TestMain:
         assert (tmp_path / ".maker-checker" / "config.toml").exists()
 
 
+class TestDefaultTemplates:
+    def test_plan_template_includes_evaluation_brief(self):
+        text = mc.default_stage_template_path("plan").read_text(encoding="utf-8")
+        assert "## Evaluation Brief" in text
+        assert "{evaluation_prompt}" in text
+
+    def test_execute_template_includes_evaluation_brief(self):
+        text = mc.default_stage_template_path("execute").read_text(encoding="utf-8")
+        assert "## Evaluation Brief" in text
+        assert "{evaluation_prompt}" in text
+
+
 class TestHistoryContext:
     def test_render_history_context_is_compact(self):
         entries = [
@@ -1613,6 +1819,8 @@ class TestBootstrapWorkspace:
         assert 'worktrees_dir = "worktrees"' in config_text
         assert 'template_file = "templates/stages/plan.md"' in config_text
         assert "history_limit = 2" in config_text
+        assert '"--json"' in config_text
+        assert 'model_reasoning_effort=\\"high\\"' in config_text
 
     def test_init_workspace_refuses_to_overwrite_without_force(self, tmp_path: Path):
         bootstrap.init_workspace(tmp_path)

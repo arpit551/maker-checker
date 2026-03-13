@@ -6,6 +6,9 @@ Critique the plan before execution.
 ## Task Brief
 {task_prompt}
 
+## Evaluation Brief
+{evaluation_prompt}
+
 ## Recent Run Memory
 {recent_run_memory}
 
@@ -19,6 +22,8 @@ Critique the plan before execution.
 - Use only the provided text context.
 - Do not infer repository state, commit history, existing artifacts, prior logs, device state, or environment prerequisites unless they are explicitly present in the prompt.
 - Focus on blocking issues: invented assumptions, missing verification, unsafe sequencing, missing rollback/safety steps, or ambiguity that would cause wasted execution.
+- Flag plans that defer routine checks back to the user instead of resolving them directly during execution.
+- Flag plans that ignore explicit verification commands, budgets, or artifact requirements from the evaluation brief without a clear reason.
 - Prefer corrections that would materially change execution quality. Ignore style-only comments.
 - If a critique point depends on information that was not provided, do not state it as fact.
 - Reference the specific step, section, or phrase you are critiquing.

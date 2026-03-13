@@ -49,6 +49,7 @@ def build_default_config_text() -> str:
         base_ref = "HEAD"
         worktrees_dir = "worktrees"
         apply_on_success = true
+        linked_paths = [".env", ".env.local", ".env.development", ".env.test"]
 
         [inputs]
         task_prompt_file = "briefs/task.md"
@@ -61,8 +62,9 @@ def build_default_config_text() -> str:
           "--skip-git-repo-check",
           "--dangerously-bypass-approvals-and-sandbox",
           "--ephemeral",
+          "--json",
           "-c",
-          "model_reasoning_effort=\\"low\\"",
+          "model_reasoning_effort=\\"high\\"",
           "-o",
           "{output_file}",
           "-"

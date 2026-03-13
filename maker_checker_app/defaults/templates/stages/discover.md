@@ -18,6 +18,9 @@ Inspect the available repository, runtime, and artifact context before planning.
 ## Discovery Rules
 - Ground every finding in what you actually inspect during this stage.
 - Prefer concrete evidence over interpretation: files, code paths, config entries, logs, artifacts, command output.
+- When checking runtime prerequisites, distinguish shell environment, `.env`/dotenv loading, checked-in config, installed services, and currently running processes.
+- If an entrypoint loads `.env` or other local config, verify that path before concluding a secret or setting is missing. Do not expose secret values; only report whether a required setting is present and usable.
+- Confirm cheap local prerequisites directly when practical: emulator/device availability, local service health, installed package presence, CLI help, config flags.
 - If something is unknown, say `Unknown` instead of guessing.
 - Focus on the facts that will change the plan, execution risk, or verification strategy.
 - Keep the output compact. This is a discovery note, not an essay.

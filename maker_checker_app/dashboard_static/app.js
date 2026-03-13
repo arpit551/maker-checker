@@ -1,5 +1,5 @@
 const REFRESH_MS = 2000;
-const STAGE_ORDER = ["plan", "critique", "revise", "execute", "verify", "evaluate"];
+const DEFAULT_STAGE_ORDER = ["discover", "plan", "critique", "revise", "execute", "verify", "evaluate"];
 const RUN_TABS = [
   ["prompt", "Prompt"],
   ["logs", "Logs"],
@@ -61,6 +61,11 @@ function currentCycle(status) {
 
 function currentStages(status) {
   return currentCycle(status)?.stage_details || [];
+}
+
+function stageOrder(status) {
+  const observed = currentStages(status).map((stage) => stage.stage).filter(Boolean);
+  return observed.length ? observed : DEFAULT_STAGE_ORDER;
 }
 
 function chooseDefaultStage(status) {
@@ -252,7 +257,7 @@ function renderMetricCards(status) {
 
 function renderStageStrip(status, runState) {
   const stagesByName = Object.fromEntries(currentStages(status).map((stage) => [stage.stage, stage]));
-  return STAGE_ORDER.map((stageName) => {
+  return stageOrder(status).map((stageName) => {
     const stage = stagesByName[stageName] || { stage: stageName, status: "pending" };
     const selected = runState.selectedStage === stageName;
     const klass = `${stageStateClass(stage.status)} ${selected ? "active" : ""}`;

@@ -49,6 +49,27 @@ from .text import (
 
 RUN_PROCESS_FILE = "run_process.json"
 INITIAL_USEFUL_OUTPUT_TIMEOUT_SEC = 90
+STAGE_HEARTBEAT_FILE = "heartbeat.json"
+STAGE_HEARTBEAT_INTERVAL_SEC = 5.0
+HEARTBEAT_EXCLUDED_DIRS = {
+    ".git",
+    ".venv",
+    "node_modules",
+    "__pycache__",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+}
+
+
+def normalize_agent_command(command: list[str]) -> list[str]:
+    if len(command) >= 2 and Path(command[0]).name == "codex" and command[1] == "exec" and "--json" not in command:
+        return [command[0], command[1], "--json", *command[2:]]
+    return command
+
+
+def supports_useful_output_watchdog(command: list[str]) -> bool:
+    return len(command) >= 3 and Path(command[0]).name == "codex" and command[1] == "exec" and "--json" in command
 
 
 def load_history_entries(history_dir: Path) -> list[dict[str, Any]]:
@@ -189,6 +210,79 @@ def strip_codex_log_noise(text: str, stream_name: str) -> str:
     return sanitized + ("\n" if sanitized else "")
 
 
+def _prefix_lines(text: str, prefix: str) -> str:
+    return "\n".join(f"{prefix}{line}" if line else prefix.rstrip() for line in text.splitlines())
+
+
+def format_codex_json_event(content: str) -> str:
+    stripped = content.strip()
+    if not stripped.startswith("{"):
+        return content
+    try:
+        event = json.loads(stripped)
+    except json.JSONDecodeError:
+        return content
+
+    event_type = str(event.get("type") or "").strip()
+    if not event_type:
+        return content
+
+    if event_type == "thread.started":
+        thread_id = event.get("thread_id") or event.get("threadId") or "unknown"
+        return f"thread started: {thread_id}"
+    if event_type == "turn.started":
+        return "turn started"
+    if event_type == "turn.completed":
+        usage = event.get("usage") if isinstance(event.get("usage"), dict) else {}
+        input_tokens = int(usage.get("input_tokens", 0) or 0)
+        output_tokens = int(usage.get("output_tokens", 0) or 0)
+        total_tokens = int(usage.get("total_tokens", input_tokens + output_tokens) or 0)
+        return f"turn completed | tokens in {input_tokens} out {output_tokens} total {total_tokens}"
+
+    item = event.get("item")
+    if isinstance(item, dict):
+        item_type = str(item.get("type") or "").strip()
+        if item_type == "agent_message":
+            text = str(item.get("text") or "").strip()
+            return text or content
+        if item_type == "command_execution":
+            command = str(item.get("command") or "-").strip()
+            status = str(item.get("status") or "").strip().lower()
+            exit_code = item.get("exit_code")
+            aggregated_output = str(item.get("aggregated_output") or "").strip()
+            if event_type == "item.started" or status == "in_progress":
+                return f"command started: {command}"
+            header = f"command completed (exit {exit_code if exit_code is not None else '?'})"
+            if aggregated_output:
+                return f"{header}: {command}\n{aggregated_output}"
+            return f"{header}: {command}"
+
+    return content
+
+
+def format_stage_log_text(text: str, stream_name: str) -> str:
+    sanitized = strip_codex_log_noise(text, stream_name)
+    if not sanitized:
+        return ""
+
+    rendered: list[str] = []
+    for line in sanitized.splitlines():
+        prefix = ""
+        content = line
+        if stream_name == "combined":
+            match = re.match(r"^\[(stdout|stderr)\]\s?(.*)$", line)
+            if match:
+                prefix = f"[{match.group(1)}] "
+                content = match.group(2)
+        formatted = format_codex_json_event(content)
+        if prefix:
+            rendered.append(_prefix_lines(formatted, prefix))
+        else:
+            rendered.append(formatted)
+    normalized = "\n".join(rendered).strip()
+    return normalized + ("\n" if normalized else "")
+
+
 def read_event_tail(run_dir: Path, limit: int = 20) -> list[str]:
     log_file = run_dir / "events.log"
     if not log_file.exists():
@@ -203,7 +297,8 @@ def read_stage_output_excerpt(stage_dir: Path, limit: int = 320) -> str:
             continue
         text = path.read_text(encoding="utf-8").strip()
         if text:
-            return shorten_text(text, limit=limit)
+            stream_name = "assistant_output" if filename == "assistant_output.txt" else filename.replace(".txt", "")
+            return shorten_text(format_stage_log_text(text, stream_name) or text, limit=limit)
     return ""
 
 
@@ -281,6 +376,44 @@ def read_optional_json(path: Path) -> Any | None:
         return json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
         return None
+
+
+def find_recent_workspace_activity(cwd: Path | None, min_mtime: float) -> tuple[str | None, float | None]:
+    if cwd is None or not cwd.exists() or not cwd.is_dir():
+        return None, None
+    latest_path: Path | None = None
+    latest_mtime: float | None = None
+    for root, dirnames, filenames in os.walk(cwd):
+        dirnames[:] = [name for name in dirnames if name not in HEARTBEAT_EXCLUDED_DIRS]
+        for filename in filenames:
+            if filename.endswith((".pyc", ".pyo")):
+                continue
+            candidate = Path(root) / filename
+            try:
+                mtime = candidate.stat().st_mtime
+            except OSError:
+                continue
+            if mtime < min_mtime:
+                continue
+            if latest_mtime is None or mtime >= latest_mtime:
+                latest_path = candidate
+                latest_mtime = mtime
+    if latest_path is None or latest_mtime is None:
+        return None, None
+    try:
+        relative = str(latest_path.relative_to(cwd))
+    except ValueError:
+        relative = str(latest_path)
+    return relative, latest_mtime
+
+
+def write_stage_heartbeat(stage_dir: Path, elapsed_sec: float, message: str) -> None:
+    payload = {
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+        "elapsed_sec": round(elapsed_sec, 3),
+        "message": message,
+    }
+    (stage_dir / STAGE_HEARTBEAT_FILE).write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
 def parse_iso_timestamp(value: str | None) -> datetime | None:
@@ -438,6 +571,7 @@ def build_stage_snapshot(
     reported_session_id = read_optional_text(stage_dir / "reported_session_id.txt")
     error = read_optional_text(stage_dir / "error.txt")
     exit_code_text = read_optional_text(stage_dir / "exit_code.txt")
+    heartbeat = read_optional_json(stage_dir / STAGE_HEARTBEAT_FILE) or {}
     tokens = read_optional_json(stage_dir / "tokens.json") or {
         "input_tokens": 0,
         "output_tokens": 0,
@@ -450,6 +584,8 @@ def build_stage_snapshot(
         started_dt = parse_iso_timestamp(started_at)
         if started_dt is not None:
             elapsed = round((datetime.now() - started_dt).total_seconds(), 3)
+
+    heartbeat_message = heartbeat.get("message") if isinstance(heartbeat, dict) else None
 
     return {
         "cycle": cycle_number,
@@ -466,7 +602,7 @@ def build_stage_snapshot(
         "display_session_id": reported_session_id or session_id,
         "exit_code": int(exit_code_text) if exit_code_text and exit_code_text.lstrip("-").isdigit() else None,
         "last_error": error,
-        "last_event": error or progress[cycle_number][stage_name],
+        "last_event": error or heartbeat_message or progress[cycle_number][stage_name],
         "tokens": {
             "input_tokens": int(tokens.get("input_tokens", 0)),
             "output_tokens": int(tokens.get("output_tokens", 0)),
@@ -504,14 +640,15 @@ def prepare_stage_run(
     (stage_dir / "combined.log").write_text("", encoding="utf-8")
     (stage_dir / "session_id.txt").write_text(session_id, encoding="utf-8")
     (stage_dir / "started_at.txt").write_text(started_at, encoding="utf-8")
+    write_stage_heartbeat(stage_dir, 0.0, "stage started")
 
-    command = [
+    command = normalize_agent_command([
         part.replace("{prompt_file}", str(prompt_file))
         .replace("{output_file}", str(output_file))
         .replace("{stage_dir}", str(stage_dir))
         .replace("{session_id}", session_id)
         for part in agent.command
-    ]
+    ])
     (stage_dir / "command.txt").write_text(" ".join(shlex.quote(x) for x in command), encoding="utf-8")
 
     return {
@@ -1156,7 +1293,13 @@ def run_stage(
     stderr_chunks: list[str] = []
     stdout_thread: threading.Thread | None = None
     stderr_thread: threading.Thread | None = None
-    useful_output_timeout = min(timeout, INITIAL_USEFUL_OUTPUT_TIMEOUT_SEC)
+    next_heartbeat = STAGE_HEARTBEAT_INTERVAL_SEC
+    last_activity_mtime = 0.0
+    useful_output_timeout = (
+        min(timeout, INITIAL_USEFUL_OUTPUT_TIMEOUT_SEC)
+        if supports_useful_output_watchdog(command)
+        else None
+    )
     try:
         proc = subprocess.Popen(
             command,
@@ -1192,7 +1335,23 @@ def run_stage(
             if proc.poll() is not None:
                 break
             elapsed_now = time.monotonic() - t0
-            if elapsed_now >= useful_output_timeout and not stage_has_useful_output(stage_dir, output_file):
+            if elapsed_now >= next_heartbeat:
+                activity_message = None
+                activity_path, activity_mtime = find_recent_workspace_activity(cwd, last_activity_mtime + 1e-6)
+                if activity_path is not None and activity_mtime is not None:
+                    last_activity_mtime = max(last_activity_mtime, activity_mtime)
+                    activity_message = f"activity: updated {activity_path}"
+                write_stage_heartbeat(
+                    stage_dir,
+                    elapsed_now,
+                    activity_message or f"running for {int(elapsed_now)}s",
+                )
+                next_heartbeat += STAGE_HEARTBEAT_INTERVAL_SEC
+            if (
+                useful_output_timeout is not None
+                and elapsed_now >= useful_output_timeout
+                and not stage_has_useful_output(stage_dir, output_file)
+            ):
                 proc.kill()
                 proc.wait()
                 if stdout_thread is not None:
@@ -1257,6 +1416,7 @@ def run_stage(
     (stage_dir / "ended_at.txt").write_text(ended_at, encoding="utf-8")
     (stage_dir / "exit_code.txt").write_text(str(proc.returncode), encoding="utf-8")
     (stage_dir / "elapsed_sec.txt").write_text(str(elapsed), encoding="utf-8")
+    write_stage_heartbeat(stage_dir, elapsed, "completed")
 
     combined_output = "\n".join(
         part for part in [stdout_text, stderr_text, read_optional_text(output_file) or ""] if part
