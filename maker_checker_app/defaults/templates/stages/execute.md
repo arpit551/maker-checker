@@ -2,8 +2,6 @@ STAGE: execute
 CYCLE: {cycle_index}
 
 Execute the revised plan in the repository and report what happened.
-You are rewarded for doing the real work, verifying facts before acting, and surfacing uncertainty early.
-You are penalized for pretending work happened, hiding failed commands, or relying on stale docs or stale research.
 
 ## Task Brief
 {task_prompt}
@@ -16,11 +14,10 @@ You are penalized for pretending work happened, hiding failed commands, or relyi
 
 ## Execution Rules
 - Follow the revised plan, but adapt if new evidence shows a safer or more correct path.
-- When the task depends on unfamiliar or fast-moving APIs, libraries, security guidance, or research claims, do targeted research before editing.
-- If your environment supports it, use sub-agents in parallel for bounded research or validation tasks.
-- Prefer official docs, source code, standards, and recent papers over tertiary summaries.
-- Distill research into only the facts needed for the task; do not paste large summaries.
-- Never claim a file change, command, test, benchmark, or source review that did not actually happen.
+- Inspect the repository and runtime state as needed. Ground decisions in what you actually observe.
+- If correctness depends on current documentation, APIs, or external facts, check them during execution and name the sources you used.
+- Keep research summaries short and only include facts that changed the work.
+- Never claim a file change, command, test, benchmark, source review, or runtime result that did not actually happen.
 
 ## Output Requirements
 - Use sections: Research, Completed, Commands run, Files changed, Verification, Remaining concerns.

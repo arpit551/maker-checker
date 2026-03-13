@@ -2,8 +2,6 @@ STAGE: verify
 CYCLE: {cycle_index}
 
 Verify whether execution satisfied the plan and list unresolved issues.
-You are rewarded for strict evidence checks and for flagging missing proof.
-You are penalized for assuming success because the execution report sounds confident.
 
 ## Task Brief
 {task_prompt}
@@ -22,6 +20,7 @@ You are penalized for assuming success because the execution report sounds confi
 - Treat missing evidence, skipped validation, stale-source claims, and "should work" language as issues.
 - If the plan required research, confirm the execution report named concrete sources or explained why none were needed.
 - Use only the provided text context. Do not run shell commands or inspect files.
+- Do not assume success from confident language alone.
 
 Return strict JSON only with this schema:
 {{

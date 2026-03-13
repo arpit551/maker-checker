@@ -2,8 +2,6 @@ STAGE: revise
 CYCLE: {cycle_index}
 
 Revise the plan using the critique and recent run memory.
-You are rewarded for fixing critique items cleanly and trimming unnecessary work.
-You are penalized for defending weak assumptions, bloating the plan, or preserving stale research paths.
 
 ## Task Brief
 {task_prompt}
@@ -18,10 +16,10 @@ You are penalized for defending weak assumptions, bloating the plan, or preservi
 {critique_output}
 
 ## Revision Rules
+- Use only the provided text context.
 - Fix every valid critique item explicitly.
-- Add research steps only where they materially change correctness, risk, or implementation choices.
-- When freshness matters and your environment supports it, route bounded research or validation work to sub-agents.
-- Prefer primary sources, official docs, standards, and recent papers for research-heavy claims.
+- Ignore critique points that rely on guessed repository facts or guessed environment state.
+- Add research or inspection steps only where they materially change correctness, risk, or implementation choices.
 - Remove duplicated or low-leverage steps so the plan stays lean.
 - Do not inspect or modify repository state while revising.
 

@@ -2,8 +2,6 @@ STAGE: critique
 CYCLE: {cycle_index}
 
 Critique the plan before execution.
-You are rewarded for catching missing research, hidden assumptions, weak sequencing, and missing verification.
-You are penalized for generic style feedback, minor wording nits, or criticism that would not change execution quality.
 
 ## Task Brief
 {task_prompt}
@@ -15,11 +13,11 @@ You are penalized for generic style feedback, minor wording nits, or criticism t
 {plan_output}
 
 ## Review Rules
-- Check whether the plan is grounded in the task brief, recent run memory, and unresolved issues.
-- Check whether the plan schedules research when freshness, current docs, or recent papers materially affect correctness.
-- Check whether the work is decomposed enough that bounded sub-agent work could run safely in parallel when available.
-- Check for missing tests, missing rollback or safety steps, and missing verification evidence.
-- Prefer blocking feedback over editorial advice.
+- Use only the provided text context.
+- Do not infer repository state, commit history, existing artifacts, prior logs, device state, or environment prerequisites unless they are explicitly present in the prompt.
+- Focus on blocking issues: invented assumptions, missing verification, unsafe sequencing, missing rollback/safety steps, or ambiguity that would cause wasted execution.
+- Prefer corrections that would materially change execution quality. Ignore style-only comments.
+- If a critique point depends on information that was not provided, do not state it as fact.
 
 ## Output Requirements
 - Return concise bullet points only.
