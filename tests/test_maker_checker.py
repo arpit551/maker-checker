@@ -608,7 +608,7 @@ class TestRunStage:
         agent = mc.AgentConfig(
             name="a", command=["sleep", "60"], input_mode="stdin", timeout_sec=1
         )
-        with pytest.raises(mc.WorkflowError, match="timed out"):
+        with pytest.raises(mc.WorkflowError, match="timed out|no useful output"):
             mc.run_stage(stage, agent, "", tmp_path / "stage")
 
     def test_output_file_preferred_over_stdout(self, tmp_path: Path):
@@ -943,7 +943,7 @@ class TestRunWorkflow:
 
         first_run = mc.run_workflow(cfg, run_name="first")
         second_run = mc.run_workflow(cfg, run_name="second")
-        prompt_text = (second_run / "cycle-01" / "01-plan" / "prompt.txt").read_text()
+        prompt_text = (second_run / "cycle-01" / "02-plan" / "prompt.txt").read_text()
 
         assert first_run.name in prompt_text
         assert "Outcome:" in prompt_text
@@ -994,6 +994,67 @@ class TestRunWorkflow:
         assert worktree_path != tmp_workspace
         assert (tmp_workspace / "state.txt").read_text() == "baseline\n"
         assert (worktree_path / "state.txt").read_text() == "baseline\nchanged\n"
+
+    def test_successful_run_can_apply_changes_back_to_base_checkout(self, tmp_workspace: Path):
+        mock_script = tmp_workspace / "mock_apply_back.sh"
+        mock_script.write_text(textwrap.dedent("""\
+            #!/usr/bin/env bash
+            prompt="$(cat)"
+            stage="$(printf '%s\\n' "$prompt" | awk -F': ' '/^STAGE: / {print tolower($2); exit}')"
+            case "$stage" in
+              execute)
+                printf 'changed\\n' >> state.txt
+                echo "applied change"
+                ;;
+              verify|evaluate) echo '{"pass": true, "issues": []}' ;;
+              *) echo "output for $stage" ;;
+            esac
+        """))
+        mock_script.chmod(0o755)
+        (tmp_workspace / ".gitignore").write_text("runs/\n.maker-checker/\n", encoding="utf-8")
+        subprocess.run(["git", "add", ".gitignore", str(mock_script)], cwd=tmp_workspace, check=True, capture_output=True, text=True)
+        subprocess.run(
+            ["git", "commit", "-m", "prepare apply-back fixtures"],
+            cwd=tmp_workspace,
+            check=True,
+            capture_output=True,
+            text=True,
+            env=GIT_ENV,
+        )
+
+        cfg = mc.WorkflowConfig(
+            max_cycles=1,
+            artifacts_dir=tmp_workspace / "runs",
+            task_prompt_file=tmp_workspace / "inputs" / "task_prompt.txt",
+            evaluation_prompt_file=tmp_workspace / "inputs" / "evaluation_prompt.txt",
+            agents={"mock": mc.AgentConfig(
+                name="mock",
+                command=[str(mock_script)],
+                input_mode="stdin",
+                timeout_sec=10,
+            )},
+            stages={
+                name: mc.StageConfig(
+                    name=name,
+                    agent="mock",
+                    template_file=tmp_workspace / "prompts" / "stages" / f"{name}.txt",
+                )
+                for name in mc.REQUIRED_STAGES
+            },
+            git=mc.GitConfig(
+                mode="worktree",
+                base_ref="HEAD",
+                worktrees_dir=tmp_workspace / ".maker-checker" / "worktrees",
+                apply_on_success=True,
+            ),
+        )
+
+        run_dir = mc.run_workflow(cfg, run_name="apply-back")
+        summary = json.loads((run_dir / "summary.json").read_text())
+
+        assert summary["completed"] is True
+        assert summary["workspace"]["apply_result"]["status"] == "applied"
+        assert (tmp_workspace / "state.txt").read_text() == "baseline\nchanged\n"
 
     def test_regressed_cycle_rolls_back_worktree(self, tmp_workspace: Path):
         mock_script = tmp_workspace / "mock_regress.sh"
@@ -1137,7 +1198,7 @@ class TestDashboardHelpers:
         )
 
         run_dir = tmp_workspace / "runs" / "20260312-live"
-        stage_dir = run_dir / "cycle-01" / "01-plan"
+        stage_dir = run_dir / "cycle-01" / "02-plan"
         stage_dir.mkdir(parents=True)
         (stage_dir / "started_at.txt").write_text("2020-01-01T00:00:00\n")
         (stage_dir / "session_id.txt").write_text("session-1\n")
@@ -1184,6 +1245,7 @@ class TestDashboardHelpers:
         assert detail["active_stage"] == "plan"
         assert detail["last_event"] == "[2026-03-12T00:28:10] cycle 1 stage plan started via codex"
         assert detail["runtime_totals"]["seconds_running"] > 0
+        assert detail["what_happens_next"] == "Next expected step: plan."
 
     def test_load_run_detail_repairs_orphaned_running_run(self, tmp_workspace: Path):
         cfg = mc.WorkflowConfig(
@@ -1208,7 +1270,7 @@ class TestDashboardHelpers:
         )
 
         run_dir = tmp_workspace / "runs" / "20260312-stale"
-        stage_dir = run_dir / "cycle-01" / "01-plan"
+        stage_dir = run_dir / "cycle-01" / "02-plan"
         stage_dir.mkdir(parents=True)
         (stage_dir / "stderr.txt").write_text("")
         (stage_dir / "combined.log").write_text("")
@@ -1275,7 +1337,7 @@ class TestDashboardHelpers:
         )
 
         run_dir = tmp_workspace / "runs" / "20260312-logs"
-        stage_dir = run_dir / "cycle-01" / "01-plan"
+        stage_dir = run_dir / "cycle-01" / "02-plan"
         stage_dir.mkdir(parents=True)
         summary = {
             "started_at": "2020-01-01T00:00:00",

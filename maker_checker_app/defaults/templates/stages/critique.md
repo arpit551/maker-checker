@@ -9,6 +9,9 @@ Critique the plan before execution.
 ## Recent Run Memory
 {recent_run_memory}
 
+## Discovery Findings
+{discover_output}
+
 ## Plan To Critique
 {plan_output}
 
@@ -18,6 +21,8 @@ Critique the plan before execution.
 - Focus on blocking issues: invented assumptions, missing verification, unsafe sequencing, missing rollback/safety steps, or ambiguity that would cause wasted execution.
 - Prefer corrections that would materially change execution quality. Ignore style-only comments.
 - If a critique point depends on information that was not provided, do not state it as fact.
+- Reference the specific step, section, or phrase you are critiquing.
+- If something is unknown from the prompt, say `Unknown from provided context` instead of guessing.
 
 ## Output Requirements
 - Return concise bullet points only.

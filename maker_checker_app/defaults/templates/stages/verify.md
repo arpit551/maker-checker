@@ -21,6 +21,7 @@ Verify whether execution satisfied the plan and list unresolved issues.
 - If the plan required research, confirm the execution report named concrete sources or explained why none were needed.
 - Use only the provided text context. Do not run shell commands or inspect files.
 - Do not assume success from confident language alone.
+- If the evidence is incomplete, fail the verification and say what is missing.
 
 Return strict JSON only with this schema:
 {{

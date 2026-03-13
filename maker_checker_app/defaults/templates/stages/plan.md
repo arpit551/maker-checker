@@ -9,6 +9,9 @@ Produce the next implementation plan.
 ## Recent Run Memory
 {recent_run_memory}
 
+## Discovery Findings
+{discover_output}
+
 ## Unresolved Issues From The Previous Cycle
 {unresolved_issues_bulleted}
 
@@ -18,11 +21,12 @@ Produce the next implementation plan.
 ## Planning Rules
 - Use only the provided text context.
 - Do not invent repository facts, files, commits, logs, prior runs, test coverage, or environment state that were not provided.
-- Start from the task brief, recent run memory, unresolved issues, and previous plan.
+- Start from the task brief, discovery findings, recent run memory, unresolved issues, and previous plan.
 - If the next step depends on inspecting the repository, logs, runtime artifacts, or current docs, say exactly what should be checked during execution. Do not pretend that work already happened.
 - Prefer the smallest maintainable path that can be verified clearly.
 - Keep the plan concise and concrete. Do not restate the full brief.
 - Call out unknowns and evidence needed instead of guessing.
+- If the provided context is insufficient, say so explicitly and make the first steps reduce that uncertainty.
 
 ## Output Requirements
 - Return Markdown only.

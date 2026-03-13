@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any
 
 
-REQUIRED_STAGES = ("plan", "critique", "revise", "execute", "verify", "evaluate")
+REQUIRED_STAGES = ("discover", "plan", "critique", "revise", "execute", "verify", "evaluate")
 STATE_SCHEMA_VERSION = "v1"
 DEFAULT_WORKSPACE_DIRNAME = ".maker-checker"
 DEFAULT_CONFIG_FILE = f"{DEFAULT_WORKSPACE_DIRNAME}/config.toml"
@@ -16,6 +16,7 @@ DEFAULT_HISTORY_LIMIT = 2
 DEFAULT_GIT_MODE = "worktree"
 DEFAULT_GIT_BASE_REF = "HEAD"
 DEFAULT_WORKTREES_DIRNAME = "worktrees"
+DEFAULT_GIT_APPLY_ON_SUCCESS = False
 GIT_MODES = ("worktree", "inplace")
 
 STATUS_PENDING = "pending"
@@ -60,6 +61,7 @@ class GitConfig:
     mode: str = DEFAULT_GIT_MODE
     base_ref: str = DEFAULT_GIT_BASE_REF
     worktrees_dir: Path | None = None
+    apply_on_success: bool = DEFAULT_GIT_APPLY_ON_SUCCESS
 
 
 @dataclass

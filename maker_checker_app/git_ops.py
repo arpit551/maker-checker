@@ -29,6 +29,7 @@ class GitRunContext:
     current_checkpoint: str | None = None
     checkpoints: list[dict[str, Any]] = field(default_factory=list)
     rollbacks: list[dict[str, Any]] = field(default_factory=list)
+    apply_result: dict[str, Any] | None = None
 
 
 def run_git(args: list[str], cwd: Path, env: dict[str, str] | None = None) -> str:
@@ -39,6 +40,29 @@ def run_git(args: list[str], cwd: Path, env: dict[str, str] | None = None) -> st
         ["git", *args],
         cwd=cwd,
         env=merged_env,
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        stderr = proc.stderr.strip() or proc.stdout.strip() or "git command failed"
+        raise WorkflowError(f"git {' '.join(args)!r} failed in {cwd}: {stderr}")
+    return proc.stdout.strip()
+
+
+def run_git_with_input(
+    args: list[str],
+    cwd: Path,
+    input_text: str,
+    env: dict[str, str] | None = None,
+) -> str:
+    merged_env = os.environ.copy()
+    if env:
+        merged_env.update(env)
+    proc = subprocess.run(
+        ["git", *args],
+        cwd=cwd,
+        env=merged_env,
+        input=input_text,
         capture_output=True,
         text=True,
     )
@@ -127,6 +151,70 @@ def rollback_to_checkpoint(context: GitRunContext, commit: str, reason: str, cyc
     )
 
 
+def apply_run_changes(context: GitRunContext, run_id: str) -> dict[str, Any]:
+    if context.mode != "worktree":
+        result = {"status": "not_needed", "reason": "run executed in-place"}
+        context.apply_result = result
+        return result
+
+    if context.current_checkpoint is None or context.current_checkpoint == context.base_commit:
+        result = {"status": "no_changes", "reason": "run produced no committed diff"}
+        context.apply_result = result
+        return result
+
+    current_head = resolve_commit(context.repo_root, "HEAD")
+    if current_head != context.base_commit:
+        result = {
+            "status": "skipped",
+            "reason": "base checkout moved since the run started",
+            "target_head": current_head,
+        }
+        context.apply_result = result
+        return result
+
+    porcelain = run_git(["status", "--porcelain"], cwd=context.repo_root)
+    if porcelain.strip():
+        result = {
+            "status": "skipped",
+            "reason": "base checkout is not clean",
+        }
+        context.apply_result = result
+        return result
+
+    patch = subprocess.run(
+        ["git", "diff", "--binary", context.base_commit, context.current_checkpoint],
+        cwd=context.cwd,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if patch.returncode != 0:
+        raise WorkflowError(
+            f"git diff failed while preparing apply-back for run {run_id}: "
+            f"{patch.stderr.strip() or patch.stdout.strip() or 'unknown error'}"
+        )
+    if not patch.stdout.strip():
+        result = {"status": "no_changes", "reason": "run produced no diff against the base commit"}
+        context.apply_result = result
+        return result
+
+    run_git_with_input(["apply", "--check", "--index", "--3way", "-"], cwd=context.repo_root, input_text=patch.stdout)
+    run_git_with_input(["apply", "--index", "--3way", "-"], cwd=context.repo_root, input_text=patch.stdout)
+    try:
+        target_branch = run_git(["rev-parse", "--abbrev-ref", "HEAD"], cwd=context.repo_root)
+    except WorkflowError:
+        target_branch = None
+    result = {
+        "status": "applied",
+        "reason": "applied successful run changes back to the base checkout",
+        "target_head": current_head,
+        "target_branch": target_branch,
+        "applied_commit": context.current_checkpoint,
+    }
+    context.apply_result = result
+    return result
+
+
 def describe_context(context: GitRunContext) -> dict[str, Any]:
     return {
         "mode": context.mode,
@@ -139,4 +227,5 @@ def describe_context(context: GitRunContext) -> dict[str, Any]:
         "current_checkpoint": context.current_checkpoint,
         "checkpoints": list(context.checkpoints),
         "rollbacks": list(context.rollbacks),
+        "apply_result": context.apply_result,
     }

@@ -13,6 +13,7 @@ from .resources import (
 )
 
 STAGE_AGENT_MAP = {
+    "discover": "codex",
     "plan": "codex",
     "critique": "claude",
     "revise": "codex",
@@ -47,6 +48,7 @@ def build_default_config_text() -> str:
         mode = "worktree"
         base_ref = "HEAD"
         worktrees_dir = "worktrees"
+        apply_on_success = true
 
         [inputs]
         task_prompt_file = "briefs/task.md"

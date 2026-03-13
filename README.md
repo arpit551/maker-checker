@@ -1,13 +1,14 @@
 # maker-checker
 
-`maker-checker` runs a six-stage maker-checker loop:
+`maker-checker` runs a seven-stage maker-checker loop:
 
-1. Codex plans
-2. Claude critiques
-3. Codex revises
-4. Claude executes
-5. Codex verifies
-6. Codex evaluates
+1. Codex discovers grounded repo/runtime facts
+2. Codex plans
+3. Claude critiques
+4. Codex revises
+5. Claude executes
+6. Codex verifies
+7. Codex evaluates
 
 The default user workflow is centered on a hidden project-local workspace at `.maker-checker/`. That folder holds the editable config, briefs, templates, run artifacts, and dashboard state.
 
@@ -102,9 +103,10 @@ The default execution mode is git-isolated:
 
 - `maker-checker run` creates a dedicated branch and worktree for that run
 - all stage commands execute inside that worktree
-- the main checkout stays untouched
+- the main checkout stays untouched while the loop is running
 - each cycle is checkpointed inside the run branch
 - if a later cycle clearly regresses, the runner resets the worktree back to the last accepted checkpoint
+- fresh workspaces also default to `git.apply_on_success = true`, which safely applies successful changes back to the base checkout only when that checkout is still clean and unchanged since the run started
 
 This means the loop can iterate aggressively without repeatedly dirtying your main branch.
 
@@ -141,7 +143,7 @@ Each run directory also contains:
 The dashboard UI is run-centric:
 
 - each run is a collapsible card
-- each open run exposes stage pills for `plan`, `critique`, `revise`, `execute`, `verify`, and `evaluate`
+- each open run exposes stage pills for `discover`, `plan`, `critique`, `revise`, `execute`, `verify`, and `evaluate`
 - tabs separate `Prompt`, `Logs`, `Output`, `Summary`, and `Live`
 - the live view shows the current stage plus live logs when a run is active
 

@@ -14,6 +14,7 @@ from typing import Any
 
 from .config import get_history_dir
 from .git_ops import (
+    apply_run_changes,
     create_checkpoint,
     create_run_context,
     describe_context,
@@ -47,6 +48,7 @@ from .text import (
 
 
 RUN_PROCESS_FILE = "run_process.json"
+INITIAL_USEFUL_OUTPUT_TIMEOUT_SEC = 90
 
 
 def load_history_entries(history_dir: Path) -> list[dict[str, Any]]:
@@ -254,6 +256,22 @@ def read_optional_text(path: Path) -> str | None:
         return None
     text = path.read_text(encoding="utf-8").strip()
     return text or None
+
+
+def stage_has_useful_output(stage_dir: Path, output_file: Path) -> bool:
+    assistant_output = read_optional_text(output_file)
+    if assistant_output:
+        return True
+
+    stdout_text = read_optional_text(stage_dir / "stdout.txt")
+    if stdout_text:
+        return True
+
+    stderr_text = read_optional_text(stage_dir / "stderr.txt")
+    if stderr_text and strip_codex_log_noise(stderr_text, "stderr").strip():
+        return True
+
+    return False
 
 
 def read_optional_json(path: Path) -> Any | None:
@@ -718,7 +736,7 @@ def build_status_payload(
     current_attempt = active_run_cycle or (latest_cycle["cycle"] if latest_cycle else 1)
     current_cycle_record = active_cycle_snapshot or latest_cycle
     next_attempt = None
-    if latest_cycle and not summary.get("completed") and latest_cycle["cycle"] < config.max_cycles:
+    if not is_running and latest_cycle and not summary.get("completed") and latest_cycle["cycle"] < config.max_cycles:
         next_attempt = {
             "attempt": latest_cycle["cycle"] + 1,
             "reason": build_retry_reason(latest_cycle),
@@ -1138,6 +1156,7 @@ def run_stage(
     stderr_chunks: list[str] = []
     stdout_thread: threading.Thread | None = None
     stderr_thread: threading.Thread | None = None
+    useful_output_timeout = min(timeout, INITIAL_USEFUL_OUTPUT_TIMEOUT_SEC)
     try:
         proc = subprocess.Popen(
             command,
@@ -1169,7 +1188,37 @@ def run_stage(
             proc.stdin.write(prompt)
             proc.stdin.close()
 
-        proc.wait(timeout=timeout)
+        while True:
+            if proc.poll() is not None:
+                break
+            elapsed_now = time.monotonic() - t0
+            if elapsed_now >= useful_output_timeout and not stage_has_useful_output(stage_dir, output_file):
+                proc.kill()
+                proc.wait()
+                if stdout_thread is not None:
+                    stdout_thread.join()
+                if stderr_thread is not None:
+                    stderr_thread.join()
+                ended_at = datetime.now().isoformat(timespec="seconds")
+                (stage_dir / "ended_at.txt").write_text(ended_at, encoding="utf-8")
+                (stage_dir / "elapsed_sec.txt").write_text(str(round(elapsed_now, 3)), encoding="utf-8")
+                (stage_dir / "error.txt").write_text(
+                    (
+                        f"Stage {stage.name!r} produced no useful output after "
+                        f"{int(useful_output_timeout)}s while running {agent.name!r}."
+                    ),
+                    encoding="utf-8",
+                )
+                raise WorkflowError(
+                    f"Stage {stage.name!r} produced no useful output after {int(useful_output_timeout)}s while running {agent.name!r}."
+                )
+            remaining = timeout - elapsed_now
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(command, timeout)
+            try:
+                proc.wait(timeout=min(1, remaining))
+            except subprocess.TimeoutExpired:
+                continue
     except FileNotFoundError as exc:
         (stage_dir / "error.txt").write_text(
             f"Command not found for agent {agent.name!r}: {command[0]!r}.",
@@ -1533,6 +1582,20 @@ def run_workflow(config: WorkflowConfig, run_name: str | None = None) -> Path:
         summary["ended_at"] = datetime.now().isoformat(timespec="seconds")
         if summary.get("completed"):
             append_event(run_dir, "run completed successfully")
+            if config.git.apply_on_success:
+                try:
+                    apply_result = apply_run_changes(git_context, run_dir.name)
+                except WorkflowError as exc:
+                    apply_result = {
+                        "status": "failed",
+                        "reason": str(exc),
+                    }
+                    git_context.apply_result = apply_result
+                summary["workspace"] = describe_context(git_context)
+                append_event(
+                    run_dir,
+                    f"apply-on-success {apply_result['status']}: {apply_result.get('reason', 'no reason recorded')}",
+                )
         else:
             append_event(run_dir, "run stopped at max cycles with unresolved issues")
         finalize_run(

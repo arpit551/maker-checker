@@ -12,6 +12,7 @@ except ModuleNotFoundError:  # pragma: no cover
 from .models import (
     DEFAULT_EVALUATION_BRIEF,
     DEFAULT_GIT_BASE_REF,
+    DEFAULT_GIT_APPLY_ON_SUCCESS,
     DEFAULT_GIT_MODE,
     DEFAULT_HISTORY_DIR,
     DEFAULT_HISTORY_LIMIT,
@@ -118,6 +119,12 @@ def load_config(config_path: Path) -> WorkflowConfig:
     stages: dict[str, StageConfig] = {}
     for stage_name in REQUIRED_STAGES:
         stage_raw = stages_raw.get(stage_name)
+        if stage_raw is None and stage_name == "discover":
+            plan_stage_raw = stages_raw.get("plan")
+            if isinstance(plan_stage_raw, dict) and isinstance(plan_stage_raw.get("agent"), str) and plan_stage_raw.get("agent"):
+                stage_raw = {
+                    "agent": plan_stage_raw["agent"],
+                }
         if not stage_raw:
             raise WorkflowError(f"Missing stage configuration: [stages.{stage_name}]")
         agent = stage_raw.get("agent")
@@ -160,6 +167,10 @@ def load_config(config_path: Path) -> WorkflowConfig:
     else:
         raise WorkflowError("git.worktrees_dir must be a non-empty string if provided.")
 
+    git_apply_on_success_raw = git_raw.get("apply_on_success", DEFAULT_GIT_APPLY_ON_SUCCESS)
+    if not isinstance(git_apply_on_success_raw, bool):
+        raise WorkflowError("git.apply_on_success must be a boolean if provided.")
+
     return WorkflowConfig(
         max_cycles=max_cycles,
         artifacts_dir=artifacts_dir,
@@ -175,5 +186,6 @@ def load_config(config_path: Path) -> WorkflowConfig:
             mode=git_mode,
             base_ref=git_base_ref.strip(),
             worktrees_dir=git_worktrees_dir,
+            apply_on_success=git_apply_on_success_raw,
         ),
     )

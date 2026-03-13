@@ -26,6 +26,7 @@ Evaluate the run against the rubric and list any remaining issues.
 - Fail invented claims, skipped validation, missing evidence, and work that does not address the requested outcome.
 - If the task depended on current external facts, expect named sources or an explicit explanation of why no source check was needed.
 - Use only the provided text context. Do not run shell commands or inspect files.
+- If the available evidence is too weak to pass confidently, fail and explain why.
 
 Return strict JSON only with this schema:
 {{

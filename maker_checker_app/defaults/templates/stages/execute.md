@@ -9,6 +9,9 @@ Execute the revised plan in the repository and report what happened.
 ## Recent Run Memory
 {recent_run_memory}
 
+## Discovery Findings
+{discover_output}
+
 ## Revised Plan
 {revise_output}
 
@@ -18,6 +21,7 @@ Execute the revised plan in the repository and report what happened.
 - If correctness depends on current documentation, APIs, or external facts, check them during execution and name the sources you used.
 - Keep research summaries short and only include facts that changed the work.
 - Never claim a file change, command, test, benchmark, source review, or runtime result that did not actually happen.
+- If a command fails or evidence is incomplete, report that directly instead of smoothing it over.
 
 ## Output Requirements
 - Use sections: Research, Completed, Commands run, Files changed, Verification, Remaining concerns.

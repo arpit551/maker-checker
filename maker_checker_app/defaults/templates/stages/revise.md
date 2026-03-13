@@ -9,6 +9,9 @@ Revise the plan using the critique and recent run memory.
 ## Recent Run Memory
 {recent_run_memory}
 
+## Discovery Findings
+{discover_output}
+
 ## Current Plan
 {plan_output}
 
@@ -22,6 +25,7 @@ Revise the plan using the critique and recent run memory.
 - Add research or inspection steps only where they materially change correctness, risk, or implementation choices.
 - Remove duplicated or low-leverage steps so the plan stays lean.
 - Do not inspect or modify repository state while revising.
+- If the critique contains ungrounded claims, drop them rather than carrying them forward.
 
 ## Output Requirements
 - Return Markdown only.

@@ -5,6 +5,7 @@ from .cli import main, parse_args
 from .config import _ensure_list_command, get_history_dir, load_config
 from .git_ops import (
     GitRunContext,
+    apply_run_changes,
     create_checkpoint,
     create_run_context,
     describe_context,
@@ -16,6 +17,7 @@ from .git_ops import (
 from .models import (
     DEFAULT_CONFIG_FILE,
     DEFAULT_EVALUATION_BRIEF,
+    DEFAULT_GIT_APPLY_ON_SUCCESS,
     DEFAULT_GIT_BASE_REF,
     DEFAULT_GIT_MODE,
     DEFAULT_HISTORY_DIR,
@@ -78,6 +80,7 @@ except PackageNotFoundError:  # pragma: no cover
 __all__ = [
     "DEFAULT_EVALUATION_BRIEF",
     "DEFAULT_CONFIG_FILE",
+    "DEFAULT_GIT_APPLY_ON_SUCCESS",
     "DEFAULT_GIT_BASE_REF",
     "DEFAULT_GIT_MODE",
     "DEFAULT_HISTORY_DIR",
@@ -102,6 +105,7 @@ __all__ = [
     "WorkflowError",
     "__version__",
     "_ensure_list_command",
+    "apply_run_changes",
     "append_history_entry",
     "bootstrap_main",
     "bootstrap_parse_args",

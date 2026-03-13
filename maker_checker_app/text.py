@@ -205,6 +205,7 @@ def build_cycle_context(
     for key, value in stage_outputs.items():
         context[f"{key}_output"] = value
 
+    context.setdefault("discover_output", "")
     context.setdefault("plan_output", "")
     context.setdefault("critique_output", "")
     context.setdefault("revise_output", "")
