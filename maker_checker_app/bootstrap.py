@@ -17,24 +17,29 @@ STAGE_AGENT_MAP = {
     "plan": "codex",
     "critique": "claude",
     "revise": "codex",
-    "execute": "claude",
+    "execute": "codex",
     "verify": "codex",
     "evaluate": "codex",
+}
+
+STAGE_TIMEOUT_OVERRIDES = {
+    "execute": 1200,
+    "verify": 1800,
 }
 
 
 def build_default_config_text() -> str:
     stage_blocks = []
     for stage_name in REQUIRED_STAGES:
-        stage_blocks.append(
-            textwrap.dedent(
-                f"""\
-                [stages.{stage_name}]
-                agent = "{STAGE_AGENT_MAP[stage_name]}"
-                template_file = "templates/stages/{stage_name}.md"
-                """
-            ).strip()
-        )
+        lines = [
+            f"[stages.{stage_name}]",
+            f'agent = "{STAGE_AGENT_MAP[stage_name]}"',
+            f'template_file = "templates/stages/{stage_name}.md"',
+        ]
+        timeout_override = STAGE_TIMEOUT_OVERRIDES.get(stage_name)
+        if timeout_override is not None:
+            lines.append(f"timeout_sec = {timeout_override}")
+        stage_blocks.append("\n".join(lines))
 
     return textwrap.dedent(
         """\

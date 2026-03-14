@@ -1168,6 +1168,59 @@ class TestRunWorkflow:
         assert summary["workspace"]["apply_result"]["status"] == "applied"
         assert (tmp_workspace / "state.txt").read_text() == "baseline\nchanged\n"
 
+    def test_apply_back_ignores_untracked_files_in_base_checkout(self, tmp_workspace: Path):
+        mock_script = tmp_workspace / "mock_apply_back_untracked.sh"
+        mock_script.write_text(textwrap.dedent("""\
+            #!/usr/bin/env bash
+            prompt="$(cat)"
+            stage="$(printf '%s\\n' "$prompt" | awk -F': ' '/^STAGE: / {print tolower($2); exit}')"
+            case "$stage" in
+              execute)
+                printf 'changed\\n' >> state.txt
+                echo "applied change"
+                ;;
+              verify|evaluate) echo '{"pass": true, "issues": []}' ;;
+              *) echo "output for $stage" ;;
+            esac
+        """))
+        mock_script.chmod(0o755)
+        (tmp_workspace / "notes.local.txt").write_text("keep me untracked\n", encoding="utf-8")
+
+        cfg = mc.WorkflowConfig(
+            max_cycles=1,
+            artifacts_dir=tmp_workspace / "runs",
+            task_prompt_file=tmp_workspace / "inputs" / "task_prompt.txt",
+            evaluation_prompt_file=tmp_workspace / "inputs" / "evaluation_prompt.txt",
+            agents={"mock": mc.AgentConfig(
+                name="mock",
+                command=[str(mock_script)],
+                input_mode="stdin",
+                timeout_sec=10,
+            )},
+            stages={
+                name: mc.StageConfig(
+                    name=name,
+                    agent="mock",
+                    template_file=tmp_workspace / "prompts" / "stages" / f"{name}.txt",
+                )
+                for name in mc.REQUIRED_STAGES
+            },
+            git=mc.GitConfig(
+                mode="worktree",
+                base_ref="HEAD",
+                worktrees_dir=tmp_workspace / ".maker-checker" / "worktrees",
+                apply_on_success=True,
+            ),
+        )
+
+        run_dir = mc.run_workflow(cfg, run_name="apply-back-untracked")
+        summary = json.loads((run_dir / "summary.json").read_text())
+
+        assert summary["completed"] is True
+        assert summary["workspace"]["apply_result"]["status"] == "applied"
+        assert (tmp_workspace / "state.txt").read_text() == "baseline\nchanged\n"
+        assert (tmp_workspace / "notes.local.txt").read_text() == "keep me untracked\n"
+
     def test_regressed_cycle_rolls_back_worktree(self, tmp_workspace: Path):
         mock_script = tmp_workspace / "mock_regress.sh"
         mock_script.write_text(textwrap.dedent("""\
@@ -1817,6 +1870,9 @@ class TestBootstrapWorkspace:
         assert '[git]' in config_text
         assert 'mode = "worktree"' in config_text
         assert 'worktrees_dir = "worktrees"' in config_text
+        assert '[stages.execute]\nagent = "codex"' in config_text
+        assert '[stages.execute]\nagent = "codex"\ntemplate_file = "templates/stages/execute.md"\ntimeout_sec = 1200' in config_text
+        assert '[stages.verify]\nagent = "codex"\ntemplate_file = "templates/stages/verify.md"\ntimeout_sec = 1800' in config_text
         assert 'template_file = "templates/stages/plan.md"' in config_text
         assert "history_limit = 2" in config_text
         assert '"--json"' in config_text

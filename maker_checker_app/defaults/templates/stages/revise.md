@@ -29,7 +29,7 @@ Revise the plan using the critique and recent run memory.
 - Remove duplicated or low-leverage steps so the plan stays lean.
 - Do not inspect or modify repository state while revising.
 - Replace user-directed follow-up questions with direct checks, safe defaults, or explicit blocker branches whenever possible.
-- Preserve any explicit verification command, budget, or artifact requirement from the evaluation brief unless the critique gives a grounded reason to change it.
+- Preserve any explicit verification command, budget, or artifact requirement from the evaluation brief, but keep it assigned to `Verify:` steps unless the critique gives a grounded reason to move it earlier.
 - If the critique contains ungrounded claims, drop them rather than carrying them forward.
 
 ## Output Requirements
@@ -38,3 +38,4 @@ Revise the plan using the critique and recent run memory.
 - In `Research`, write `none` if no extra research is needed.
 - Address critique items explicitly.
 - Remove invented assumptions rather than doubling down on them.
+- In `Steps`, prefix each item with either `Execute:` or `Verify:` and keep the exact evaluation command in `Verify:` by default.

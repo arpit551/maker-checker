@@ -208,11 +208,11 @@ def apply_run_changes(context: GitRunContext, run_id: str) -> dict[str, Any]:
         context.apply_result = result
         return result
 
-    porcelain = run_git(["status", "--porcelain"], cwd=context.repo_root)
+    porcelain = run_git(["status", "--porcelain", "--untracked-files=no"], cwd=context.repo_root)
     if porcelain.strip():
         result = {
             "status": "skipped",
-            "reason": "base checkout is not clean",
+            "reason": "base checkout has tracked changes",
         }
         context.apply_result = result
         return result

@@ -6,8 +6,8 @@
 2. Codex plans
 3. Claude critiques
 4. Codex revises
-5. Claude executes
-6. Codex verifies
+5. Codex executes
+6. Codex verifies with the explicit validation command or bounded runtime check
 7. Codex evaluates
 
 The default user workflow is centered on a hidden project-local workspace at `.maker-checker/`. That folder holds the editable config, briefs, templates, run artifacts, and dashboard state.

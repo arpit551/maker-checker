@@ -24,6 +24,7 @@ Critique the plan before execution.
 - Focus on blocking issues: invented assumptions, missing verification, unsafe sequencing, missing rollback/safety steps, or ambiguity that would cause wasted execution.
 - Flag plans that defer routine checks back to the user instead of resolving them directly during execution.
 - Flag plans that ignore explicit verification commands, budgets, or artifact requirements from the evaluation brief without a clear reason.
+- Flag plans that put the exact evaluation command or other full-budget validation work in `Execute:` steps when `Verify:` would be the appropriate place.
 - Prefer corrections that would materially change execution quality. Ignore style-only comments.
 - If a critique point depends on information that was not provided, do not state it as fact.
 - Reference the specific step, section, or phrase you are critiquing.
